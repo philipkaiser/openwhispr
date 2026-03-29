@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useMemo, useCallback } from "react";
 import { useTranslation } from "react-i18next";
 import { Button } from "./ui/button";
 import { Loader2, Sparkles, Cloud, X, Mic, Trash2 } from "lucide-react";
@@ -46,6 +46,14 @@ export default function HistoryView({
 }: HistoryViewProps) {
   const { t } = useTranslation();
   const dataRetentionEnabled = useSettingsStore((s) => s.dataRetentionEnabled);
+  const trainingDataEnabled = useSettingsStore((s) => s.trainingDataEnabled);
+
+  const handleUpdateCorrection = useCallback(
+    async (id: number, correctedText: string, originalText: string) => {
+      await window.electronAPI?.updateTranscriptionCorrection(id, correctedText, originalText);
+    },
+    []
+  );
   const { events, isLoading: eventsLoading, isConnected } = useUpcomingEvents();
 
   const groupedHistory = useMemo(() => {
@@ -299,6 +307,8 @@ export default function HistoryView({
                           onShowAudioInFolder={onShowAudioInFolder}
                           onRetryTranscription={onRetryTranscription}
                           onOpenSettings={() => onOpenSettings("transcription")}
+                          trainingDataEnabled={trainingDataEnabled}
+                          onUpdateCorrection={handleUpdateCorrection}
                         />
                       ))}
                     </div>

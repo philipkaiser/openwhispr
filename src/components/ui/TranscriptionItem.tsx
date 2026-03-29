@@ -1,8 +1,8 @@
-import { useState } from "react";
+import { useState, useRef, useEffect, useCallback } from "react";
 import { useTranslation } from "react-i18next";
 import { Button } from "./button";
 import { Tooltip } from "./tooltip";
-import { Copy, Trash2, FileText, FolderOpen, RotateCcw, Loader2, AlertCircle } from "lucide-react";
+import { Copy, Trash2, FileText, FolderOpen, RotateCcw, Loader2, AlertCircle, Check } from "lucide-react";
 import type { TranscriptionItem as TranscriptionItemType } from "../../types/electron";
 import { cn } from "../lib/utils";
 import { getCachedPlatform } from "../../utils/platform";
@@ -22,6 +22,8 @@ interface TranscriptionItemProps {
   onShowAudioInFolder?: (id: number) => void;
   onRetryTranscription?: (id: number) => Promise<void>;
   onOpenSettings?: () => void;
+  trainingDataEnabled?: boolean;
+  onUpdateCorrection?: (id: number, correctedText: string, originalText: string) => void;
 }
 
 export default function TranscriptionItem({
@@ -31,11 +33,15 @@ export default function TranscriptionItem({
   onShowAudioInFolder,
   onRetryTranscription,
   onOpenSettings,
+  trainingDataEnabled,
+  onUpdateCorrection,
 }: TranscriptionItemProps) {
   const { t, i18n } = useTranslation();
   const [isHovered, setIsHovered] = useState(false);
   const [isExpanded, setIsExpanded] = useState(false);
   const [isRetrying, setIsRetrying] = useState(false);
+  const [showSaved, setShowSaved] = useState(false);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   const timestampSource = item.timestamp.endsWith("Z") ? item.timestamp : `${item.timestamp}Z`;
   const timestampDate = new Date(timestampSource);
@@ -60,6 +66,33 @@ export default function TranscriptionItem({
   const hasRawText = item.raw_text !== null;
   const hasAudio = item.has_audio === 1;
   const showUtilityGroup = hasRawText || hasAudio;
+  const isCorrected = item.corrected_transcription != null;
+  const displayText = isCorrected ? item.corrected_transcription! : item.text;
+  const isEditable = trainingDataEnabled && !isFailed;
+
+  const [editText, setEditText] = useState(displayText);
+
+  // Sync edit text when item changes externally (e.g., broadcast from another window)
+  useEffect(() => {
+    setEditText(isCorrected ? item.corrected_transcription! : item.text);
+  }, [item.text, item.corrected_transcription, isCorrected]);
+
+  // Auto-resize textarea
+  useEffect(() => {
+    if (textareaRef.current) {
+      textareaRef.current.style.height = "auto";
+      textareaRef.current.style.height = `${textareaRef.current.scrollHeight}px`;
+    }
+  }, [editText, isEditable]);
+
+  const handleBlur = useCallback(() => {
+    if (!onUpdateCorrection || !item.raw_text) return;
+    const trimmed = editText.trim();
+    if (trimmed === displayText) return;
+    onUpdateCorrection(item.id, trimmed, item.raw_text);
+    setShowSaved(true);
+    setTimeout(() => setShowSaved(false), 2000);
+  }, [editText, displayText, item.id, item.raw_text, onUpdateCorrection]);
 
   return (
     <div
@@ -67,7 +100,8 @@ export default function TranscriptionItem({
         "group rounded-md border px-3 py-2.5 transition-colors duration-150",
         isFailed
           ? "border-destructive/30 bg-destructive/5 hover:bg-destructive/10"
-          : "border-border/40 dark:border-border-subtle/60 bg-card/50 dark:bg-surface-2/60 hover:bg-muted/30 dark:hover:bg-surface-2/80"
+          : "border-border/40 dark:border-border-subtle/60 bg-card/50 dark:bg-surface-2/60 hover:bg-muted/30 dark:hover:bg-surface-2/80",
+        isCorrected && "border-l-2 border-l-primary"
       )}
       onMouseEnter={() => setIsHovered(true)}
       onMouseLeave={() => setIsHovered(false)}
@@ -113,9 +147,26 @@ export default function TranscriptionItem({
               </p>
             </div>
           </div>
+        ) : isEditable ? (
+          <div className="flex-1 min-w-0 relative">
+            <textarea
+              ref={textareaRef}
+              value={editText}
+              onChange={(e) => setEditText(e.target.value)}
+              onBlur={handleBlur}
+              rows={1}
+              className="w-full rounded-sm text-foreground text-sm leading-[1.5] break-words bg-transparent border-none outline-none resize-none px-2 py-1.5 focus:ring-1 focus:ring-primary/30"
+            />
+            {showSaved && (
+              <span className="absolute -bottom-4 right-0 text-[10px] text-primary flex items-center gap-0.5 animate-in fade-in duration-200">
+                <Check size={10} />
+                {t("controlPanel.history.correctionSaved")}
+              </span>
+            )}
+          </div>
         ) : (
           <p className="flex-1 min-w-0 text-foreground text-sm leading-[1.5] break-words">
-            {item.text}
+            {displayText}
           </p>
         )}
 
@@ -216,15 +267,17 @@ export default function TranscriptionItem({
         <div
           className={cn(
             "overflow-hidden transition-all duration-200",
-            isExpanded ? "max-h-96" : "max-h-0"
+            isExpanded || isCorrected ? "max-h-96" : "max-h-0"
           )}
         >
           <div className="border-t border-border/20 mt-2 pt-2">
             <span className="text-[10px] font-medium text-muted-foreground uppercase tracking-wider">
-              {t("controlPanel.history.rawTranscript")}
+              {isCorrected
+                ? t("controlPanel.history.originalModelOutput")
+                : t("controlPanel.history.rawTranscript")}
             </span>
             <p className="text-xs text-muted-foreground/80 leading-relaxed mt-1">{item.raw_text}</p>
-            {item.raw_text === item.text && (
+            {!isCorrected && item.raw_text === item.text && (
               <p className="text-[10px] text-muted-foreground/50 italic mt-1">
                 {t("controlPanel.history.noAiProcessing")}
               </p>

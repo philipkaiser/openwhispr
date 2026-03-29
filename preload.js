@@ -49,6 +49,8 @@ contextBridge.exposeInMainWorld("electronAPI", {
   retryTranscription: (id) => ipcRenderer.invoke("retry-transcription", id),
   updateTranscriptionText: (id, text, rawText) =>
     ipcRenderer.invoke("update-transcription-text", id, text, rawText),
+  updateTranscriptionCorrection: (id, correctedText, originalText) =>
+    ipcRenderer.invoke("update-transcription-correction", id, correctedText, originalText),
   getTranscriptionById: (id) => ipcRenderer.invoke("get-transcription-by-id", id),
 
   // Dictionary functions
@@ -554,6 +556,9 @@ contextBridge.exposeInMainWorld("electronAPI", {
 
   // Start minimized
   notifyStartMinimizedChanged: (enabled) => ipcRenderer.send("start-minimized-changed", enabled),
+
+  // Training data collection
+  notifyTrainingDataEnabledChanged: (enabled) => ipcRenderer.send("training-data-enabled-changed", enabled),
 
   // Auto-start management
   getAutoStartEnabled: () => ipcRenderer.invoke("get-auto-start-enabled"),

@@ -511,6 +511,7 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
           : Math.round(performance.now() - pipelineStart),
         provider: result?.source || (useLocalWhisper ? localProvider : "cloud"),
         model: activeModel || null,
+        language: getBaseLanguageCode(getSettings().preferredLanguage) || null,
       };
 
       this.onTranscriptionComplete?.(result);
@@ -927,6 +928,15 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
       logger.logReasoning("TRANSCRIPTION_EMPTY_SKIPPING_REASONING", {
         source,
         reason: "Empty text after normalization",
+      });
+      return normalizedText;
+    }
+
+    // Training data mode: skip all AI post-processing to preserve raw Whisper output
+    if (getSettings().trainingDataEnabled) {
+      logger.logReasoning("REASONING_SKIPPED_TRAINING_MODE", {
+        source,
+        reason: "Training data collection mode — AI post-processing suppressed",
       });
       return normalizedText;
     }
@@ -2477,6 +2487,7 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
           : Math.round(tBeforePaste - t0),
         provider: `${this.getStreamingProviderName()}-streaming`,
         model: streamingSttModel || null,
+        language: getBaseLanguageCode(getSettings().preferredLanguage) || null,
       };
       this.onTranscriptionComplete?.({
         success: true,

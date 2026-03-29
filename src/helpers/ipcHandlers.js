@@ -152,9 +152,17 @@ class IPCHandlers {
     const DEFAULT_RETENTION_DAYS = 30;
     const SIX_HOURS_MS = 6 * 60 * 60 * 1000;
 
+    const runCleanupIfAllowed = () => {
+      if (process.env.TRAINING_DATA_ENABLED === "true") {
+        debugLogger.debug("Audio cleanup skipped — training data collection enabled", {}, "audio-storage");
+        return;
+      }
+      this.audioStorageManager.cleanupExpiredAudio(DEFAULT_RETENTION_DAYS, this.databaseManager);
+    };
+
     // Run initial cleanup with default retention
     try {
-      this.audioStorageManager.cleanupExpiredAudio(DEFAULT_RETENTION_DAYS, this.databaseManager);
+      runCleanupIfAllowed();
     } catch (error) {
       debugLogger.error("Initial audio cleanup failed", { error: error.message }, "audio-storage");
     }
@@ -162,7 +170,7 @@ class IPCHandlers {
     // Set up periodic cleanup every 6 hours
     this._audioCleanupInterval = setInterval(() => {
       try {
-        this.audioStorageManager.cleanupExpiredAudio(DEFAULT_RETENTION_DAYS, this.databaseManager);
+        runCleanupIfAllowed();
       } catch (error) {
         debugLogger.error(
           "Periodic audio cleanup failed",
@@ -401,6 +409,7 @@ class IPCHandlers {
           audioDurationMs: metadata?.durationMs || null,
           provider: metadata?.provider || null,
           model: metadata?.model || null,
+          language: metadata?.language || null,
         });
       }
       return result;
@@ -2751,6 +2760,25 @@ class IPCHandlers {
       } catch (error) {
         debugLogger.error(
           "Failed to update transcription text",
+          { id, error: error.message },
+          "audio-storage"
+        );
+        return { success: false, error: error.message };
+      }
+    });
+
+    ipcMain.handle("update-transcription-correction", async (_event, id, correctedText, originalText) => {
+      try {
+        const result = this.databaseManager.updateTranscriptionCorrection(id, correctedText, originalText);
+        if (result?.success && result.transcription) {
+          setImmediate(() => {
+            this.broadcastToWindows("transcription-updated", result.transcription);
+          });
+        }
+        return result;
+      } catch (error) {
+        debugLogger.error(
+          "Failed to update transcription correction",
           { id, error: error.message },
           "audio-storage"
         );

@@ -14,6 +14,8 @@ export interface TranscriptionItem {
   model: string | null;
   status: TranscriptionStatus;
   error_message: string | null;
+  corrected_transcription: string | null;
+  language: string | null;
 }
 
 export interface NoteItem {
@@ -328,6 +330,11 @@ declare global {
         text: string,
         rawText: string
       ) => Promise<{ success: boolean; transcription?: TranscriptionItem; error?: string }>;
+      updateTranscriptionCorrection: (
+        id: number,
+        correctedText: string,
+        originalText: string
+      ) => Promise<{ success: boolean; transcription?: TranscriptionItem }>;
 
       // Dictionary operations
       getDictionary: () => Promise<string[]>;
@@ -758,6 +765,7 @@ declare global {
       notifyFloatingIconAutoHideChanged?: (enabled: boolean) => void;
       onFloatingIconAutoHideChanged?: (callback: (enabled: boolean) => void) => () => void;
       notifyStartMinimizedChanged?: (enabled: boolean) => void;
+      notifyTrainingDataEnabledChanged?: (enabled: boolean) => void;
       notifyPanelStartPositionChanged?: (position: string) => void;
 
       // Auto-start at login

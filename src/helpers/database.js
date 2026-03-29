@@ -16,7 +16,6 @@ class DatabaseManager {
         process.env.NODE_ENV === "development" ? "transcriptions-dev.db" : "transcriptions.db";
 
       const dbPath = path.join(app.getPath("userData"), dbFileName);
-
       this.db = new Database(dbPath);
       this.db.pragma("journal_mode = WAL");
 
@@ -64,6 +63,16 @@ class DatabaseManager {
       }
       try {
         this.db.exec("ALTER TABLE transcriptions ADD COLUMN error_message TEXT");
+      } catch (err) {
+        if (!err.message.includes("duplicate column")) throw err;
+      }
+      try {
+        this.db.exec("ALTER TABLE transcriptions ADD COLUMN corrected_transcription TEXT");
+      } catch (err) {
+        if (!err.message.includes("duplicate column")) throw err;
+      }
+      try {
+        this.db.exec("ALTER TABLE transcriptions ADD COLUMN language TEXT");
       } catch (err) {
         if (!err.message.includes("duplicate column")) throw err;
       }
@@ -408,13 +417,13 @@ class DatabaseManager {
     }
   }
 
-  updateTranscriptionAudio(id, { hasAudio, audioDurationMs, provider, model }) {
+  updateTranscriptionAudio(id, { hasAudio, audioDurationMs, provider, model, language }) {
     try {
       if (!this.db) throw new Error("Database not initialized");
       const stmt = this.db.prepare(
-        "UPDATE transcriptions SET has_audio = ?, audio_duration_ms = ?, provider = ?, model = ? WHERE id = ?"
+        "UPDATE transcriptions SET has_audio = ?, audio_duration_ms = ?, provider = ?, model = ?, language = ? WHERE id = ?"
       );
-      stmt.run(hasAudio, audioDurationMs, provider, model, id);
+      stmt.run(hasAudio, audioDurationMs, provider, model, language || null, id);
       return { success: true };
     } catch (error) {
       debugLogger.error("Error updating transcription audio", { error: error.message }, "database");
@@ -430,6 +439,22 @@ class DatabaseManager {
       return { success: true };
     } catch (error) {
       debugLogger.error("Error updating transcription text", { error: error.message }, "database");
+      throw error;
+    }
+  }
+
+  updateTranscriptionCorrection(id, correctedText, originalText) {
+    try {
+      if (!this.db) throw new Error("Database not initialized");
+      const value = correctedText === originalText ? null : correctedText;
+      const stmt = this.db.prepare(
+        "UPDATE transcriptions SET corrected_transcription = ? WHERE id = ?"
+      );
+      stmt.run(value, id);
+      const updated = this.getTranscriptionById(id);
+      return { success: true, transcription: updated };
+    } catch (error) {
+      debugLogger.error("Error updating transcription correction", { error: error.message }, "database");
       throw error;
     }
   }
