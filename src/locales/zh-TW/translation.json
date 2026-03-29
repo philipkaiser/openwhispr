@@ -260,7 +260,9 @@
       "retryError": "重新轉錄失敗",
       "audioNotFound": "找不到音訊檔案或檔案已過期",
       "noAiProcessing": "此轉錄未套用 AI 處理",
-      "rawTranscript": "原始轉錄"
+      "rawTranscript": "原始轉錄",
+      "originalModelOutput": "原始模型輸出",
+      "correctionSaved": "已儲存"
     },
     "cloudMigration": {
       "title": "歡迎使用 OpenWhispr Pro",
@@ -1354,6 +1356,9 @@
       "usageAnalyticsDescription": "分享匿名的效能指標，協助我們改善 OpenWhispr。我們絕不會傳送轉錄內容——只有計時和錯誤資料。",
       "dataRetention": "資料保留",
       "dataRetentionDescription": "將轉錄和音訊本地儲存至歷史記錄。停用後，轉錄內容會被貼上但不會被儲存。",
+      "trainingDataCollection": "訓練資料收集",
+      "trainingDataCollectionDescription": "收集配對的音訊和轉錄樣本用於微調。音訊將無限期保留，AI後處理將被停用，轉錄可以在線修正。",
+      "trainingDataRequiresRetention": "請先啟用資料保留以使用訓練資料收集。",
       "audioRetention": "音訊保留",
       "audioRetentionDescription": "將音訊錄製檔案儲存在本機以便重新轉錄和下載。檔案會在保留期限過後自動刪除。",
       "audioRetentionDisabled": "已停用",

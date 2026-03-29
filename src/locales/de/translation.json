@@ -260,7 +260,9 @@
       "retryError": "Erneute Transkription fehlgeschlagen",
       "audioNotFound": "Audiodatei nicht gefunden oder abgelaufen",
       "noAiProcessing": "Auf diese Transkription wurde keine KI-Verarbeitung angewendet",
-      "rawTranscript": "Rohtranskript"
+      "rawTranscript": "Rohtranskript",
+      "originalModelOutput": "Ursprüngliche Modellausgabe",
+      "correctionSaved": "Gespeichert"
     },
     "cloudMigration": {
       "title": "Willkommen bei OpenWhispr Pro",
@@ -1354,6 +1356,9 @@
       "usageAnalyticsDescription": "Helfen Sie uns, OpenWhispr zu verbessern, indem Sie anonyme Leistungsdaten teilen. Wir senden niemals Transkriptionsinhalte – nur Timing- und Fehlerdaten.",
       "dataRetention": "Datenaufbewahrung",
       "dataRetentionDescription": "Transkriptionen und Audio lokal im Verlauf speichern. Wenn deaktiviert, werden Transkriptionen eingefügt, aber nicht gespeichert.",
+      "trainingDataCollection": "Trainingsdaten-Erfassung",
+      "trainingDataCollectionDescription": "Gepaarte Audio- und Transkriptionsproben für Feinabstimmung sammeln. Audio wird unbegrenzt aufbewahrt, KI-Nachbearbeitung ist deaktiviert, und Transkriptionen können inline korrigiert werden.",
+      "trainingDataRequiresRetention": "Aktivieren Sie zuerst die Datenspeicherung, um die Trainingsdaten-Erfassung zu nutzen.",
       "audioRetention": "Audio-Aufbewahrung",
       "audioRetentionDescription": "Audioaufnahmen lokal für erneute Transkription und Download speichern. Dateien werden nach Ablauf der Aufbewahrungsfrist automatisch gelöscht.",
       "audioRetentionDisabled": "Deaktiviert",

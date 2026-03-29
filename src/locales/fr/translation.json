@@ -260,7 +260,9 @@
       "retryError": "Échec de la retranscription",
       "audioNotFound": "Fichier audio introuvable ou expiré",
       "noAiProcessing": "Aucun traitement IA n'a été appliqué à cette transcription",
-      "rawTranscript": "Transcription brute"
+      "rawTranscript": "Transcription brute",
+      "originalModelOutput": "Sortie originale du modèle",
+      "correctionSaved": "Enregistré"
     },
     "cloudMigration": {
       "title": "Bienvenue sur OpenWhispr Pro",
@@ -1354,6 +1356,9 @@
       "usageAnalyticsDescription": "Aidez-nous à améliorer OpenWhispr en partageant des métriques de performance anonymes. Nous n'envoyons jamais le contenu de vos transcriptions — uniquement des données de performance et d'erreurs.",
       "dataRetention": "Conservation des données",
       "dataRetentionDescription": "Stocker les transcriptions et l'audio localement dans votre historique. Lorsque désactivé, les transcriptions sont collées mais pas enregistrées.",
+      "trainingDataCollection": "Collecte de données d'entraînement",
+      "trainingDataCollectionDescription": "Collectez des échantillons audio et de transcription appariés pour l'ajustement fin. L'audio est conservé indéfiniment, le post-traitement IA est désactivé et les transcriptions peuvent être corrigées en ligne.",
+      "trainingDataRequiresRetention": "Activez d'abord la conservation des données pour utiliser la collecte de données d'entraînement.",
       "audioRetention": "Conservation de l'audio",
       "audioRetentionDescription": "Stocke les enregistrements audio localement pour la retranscription et le téléchargement. Les fichiers sont automatiquement supprimés après la période de conservation.",
       "audioRetentionDisabled": "Désactivé",

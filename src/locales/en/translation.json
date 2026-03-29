@@ -255,6 +255,8 @@
       "failedCtaAndRetry": "then click retry",
       "failedCtaSettingsOnly": "Set up your transcription provider in Settings",
       "rawTranscript": "Raw Transcript",
+      "originalModelOutput": "Original Model Output",
+      "correctionSaved": "Saved",
       "clearAll": "Clear all",
       "clearAllTitle": "Clear All Transcriptions",
       "clearAllDescription": "All transcriptions and audio files will be permanently removed.",
@@ -1411,7 +1413,10 @@
       "clearAllAudio": "Clear All Audio",
       "clearAllAudioConfirm": "Delete all stored audio files? This cannot be undone.",
       "dataRetention": "Data Retention",
-      "dataRetentionDescription": "Store transcriptions and audio locally in your history. When disabled, transcriptions are pasted but not saved."
+      "dataRetentionDescription": "Store transcriptions and audio locally in your history. When disabled, transcriptions are pasted but not saved.",
+      "trainingDataCollection": "Training Data Collection",
+      "trainingDataCollectionDescription": "Collect paired audio and transcription samples for fine-tuning. Audio is retained indefinitely, AI post-processing is disabled, and transcriptions can be corrected inline.",
+      "trainingDataRequiresRetention": "Enable data retention first to use training data collection."
     },
     "prompts": {
       "description": "View, customize, and test the unified system prompt that powers text cleanup and instruction detection",
