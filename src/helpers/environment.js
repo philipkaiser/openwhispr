@@ -27,6 +27,7 @@ const PERSISTED_KEYS = [
   "START_MINIMIZED",
   "UI_LANGUAGE",
   "WHISPER_CUDA_ENABLED",
+  "TRAINING_DATA_ENABLED",
 ];
 
 class EnvironmentManager {
@@ -183,6 +184,12 @@ class EnvironmentManager {
 
   saveStartMinimized(enabled) {
     const result = this._saveKey("START_MINIMIZED", String(enabled));
+    this.saveAllKeysToEnvFile().catch(() => {});
+    return result;
+  }
+
+  saveTrainingDataEnabled(enabled) {
+    const result = this._saveKey("TRAINING_DATA_ENABLED", String(enabled));
     this.saveAllKeysToEnvFile().catch(() => {});
     return result;
   }

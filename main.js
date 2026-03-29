@@ -551,6 +551,11 @@ async function startApp() {
     environmentManager.saveStartMinimized(enabled);
   });
 
+  ipcMain.on("training-data-enabled-changed", (_event, enabled) => {
+    if (debugLogger) debugLogger.info("Training data collection changed", { enabled });
+    environmentManager.saveTrainingDataEnabled(enabled);
+  });
+
   ipcMain.on("panel-start-position-changed", (_event, position) => {
     windowManager.setPanelStartPosition(position);
     environmentManager.savePanelStartPosition(position);

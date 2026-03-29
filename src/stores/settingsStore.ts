@@ -65,6 +65,7 @@ const BOOLEAN_SETTINGS = new Set([
   "agentEnabled",
   "keepTranscriptionInClipboard",
   "dataRetentionEnabled",
+  "trainingDataEnabled",
 ]);
 
 const ARRAY_SETTINGS = new Set(["customDictionary", "gcalAccounts"]);
@@ -147,6 +148,7 @@ export interface SettingsState
   setTelemetryEnabled: (value: boolean) => void;
   setAudioRetentionDays: (days: number) => void;
   setDataRetentionEnabled: (value: boolean) => void;
+  setTrainingDataEnabled: (value: boolean) => void;
   setAudioCuesEnabled: (value: boolean) => void;
   setPauseMediaOnDictation: (value: boolean) => void;
   setFloatingIconAutoHide: (enabled: boolean) => void;
@@ -282,6 +284,7 @@ export const useSettingsStore = create<SettingsState>()((set, get) => ({
     return isNaN(parsed) ? 30 : parsed;
   })(),
   dataRetentionEnabled: readBoolean("dataRetentionEnabled", true),
+  trainingDataEnabled: readBoolean("trainingDataEnabled", false),
   audioCuesEnabled: readBoolean("audioCuesEnabled", true),
   pauseMediaOnDictation: readBoolean("pauseMediaOnDictation", false),
   floatingIconAutoHide: readBoolean("floatingIconAutoHide", false),
@@ -450,10 +453,33 @@ export const useSettingsStore = create<SettingsState>()((set, get) => ({
   setDataRetentionEnabled: (value: boolean) => {
     if (isBrowser) localStorage.setItem("dataRetentionEnabled", String(value));
     set({ dataRetentionEnabled: value });
+    // Auto-disable training mode when data retention is turned off
+    if (!value && get().trainingDataEnabled) {
+      if (isBrowser) localStorage.setItem("trainingDataEnabled", "false");
+      set({ trainingDataEnabled: false });
+      if (isBrowser) {
+        window.electronAPI?.notifyTrainingDataEnabledChanged?.(false);
+      }
+      logger.info("Training data collection auto-disabled — data retention turned off", {}, "settings");
+    }
     logger.info(
       value
         ? "Data retention enabled — transcriptions and audio will be saved"
         : "Data retention disabled — transcriptions and audio will not be saved",
+      {},
+      "settings"
+    );
+  },
+  setTrainingDataEnabled: (value: boolean) => {
+    if (isBrowser) localStorage.setItem("trainingDataEnabled", String(value));
+    set({ trainingDataEnabled: value });
+    if (isBrowser) {
+      window.electronAPI?.notifyTrainingDataEnabledChanged?.(value);
+    }
+    logger.info(
+      value
+        ? "Training data collection enabled — audio retained indefinitely, AI post-processing disabled"
+        : "Training data collection disabled",
       {},
       "settings"
     );

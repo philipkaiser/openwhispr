@@ -56,6 +56,7 @@ export interface PrivacySettings {
   telemetryEnabled: boolean;
   audioRetentionDays: number;
   dataRetentionEnabled: boolean;
+  trainingDataEnabled: boolean;
 }
 
 export interface ThemeSettings {
@@ -251,6 +252,8 @@ function useSettingsInternal() {
     setAudioRetentionDays: store.setAudioRetentionDays,
     dataRetentionEnabled: store.dataRetentionEnabled,
     setDataRetentionEnabled: store.setDataRetentionEnabled,
+    trainingDataEnabled: store.trainingDataEnabled,
+    setTrainingDataEnabled: store.setTrainingDataEnabled,
     updateTranscriptionSettings: store.updateTranscriptionSettings,
     updateReasoningSettings: store.updateReasoningSettings,
     updateApiKeys: store.updateApiKeys,

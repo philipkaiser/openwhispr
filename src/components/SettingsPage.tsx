@@ -713,6 +713,8 @@ export default function SettingsPage({ activeSection = "general" }: SettingsPage
     setAudioRetentionDays,
     dataRetentionEnabled,
     setDataRetentionEnabled,
+    trainingDataEnabled,
+    setTrainingDataEnabled,
     customDictionary,
     setCustomDictionary,
   } = useSettings();
@@ -3305,6 +3307,22 @@ EOF`,
                     description={t("settingsPage.privacy.dataRetentionDescription")}
                   >
                     <Toggle checked={dataRetentionEnabled} onChange={setDataRetentionEnabled} />
+                  </SettingsRow>
+                </SettingsPanelRow>
+                <SettingsPanelRow>
+                  <SettingsRow
+                    label={t("settingsPage.privacy.trainingDataCollection")}
+                    description={
+                      !dataRetentionEnabled
+                        ? t("settingsPage.privacy.trainingDataRequiresRetention")
+                        : t("settingsPage.privacy.trainingDataCollectionDescription")
+                    }
+                  >
+                    <Toggle
+                      checked={trainingDataEnabled}
+                      onChange={setTrainingDataEnabled}
+                      disabled={!dataRetentionEnabled}
+                    />
                   </SettingsRow>
                 </SettingsPanelRow>
               </SettingsPanel>
