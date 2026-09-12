@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { Check } from "lucide-react";
+import { Check } from "../icons";
 import { cn } from "../lib/utils";
 import type { ActionProcessingState } from "../../hooks/useActionProcessing";
 
@@ -15,14 +15,19 @@ export default function ActionProcessingOverlay({
 }: ActionProcessingOverlayProps) {
   const { t } = useTranslation();
   const [visible, setVisible] = useState(false);
+  const [prevState, setPrevState] = useState(state);
 
-  useEffect(() => {
+  if (state !== prevState) {
+    setPrevState(state);
     if (state === "processing" || state === "success") {
       setVisible(true);
-    } else if (state === "idle") {
-      const id = setTimeout(() => setVisible(false), 300);
-      return () => clearTimeout(id);
     }
+  }
+
+  useEffect(() => {
+    if (state !== "idle") return;
+    const id = setTimeout(() => setVisible(false), 300);
+    return () => clearTimeout(id);
   }, [state]);
 
   if (!visible) return null;

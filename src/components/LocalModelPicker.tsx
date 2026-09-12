@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { ProviderTabs } from "./ui/ProviderTabs";
 import { DownloadProgressBar } from "./ui/DownloadProgressBar";
@@ -16,6 +16,7 @@ export interface LocalModel {
   sizeBytes?: number;
   description: string;
   descriptionKey?: string;
+  specUrl?: string;
   isDownloaded?: boolean;
   downloaded?: boolean;
   recommended?: boolean;
@@ -52,11 +53,19 @@ export default function LocalModelPicker({
 }: LocalModelPickerProps) {
   const { t } = useTranslation();
   const [downloadedModels, setDownloadedModels] = useState<Set<string>>(new Set());
+  const loadDownloadedModelsRequestRef = useRef(0);
+
+  const knownModelIds = useMemo(
+    () => new Set(providers.flatMap((provider) => provider.models.map((model) => model.id))),
+    [providers]
+  );
 
   const { confirmDialog, showConfirmDialog, hideConfirmDialog } = useDialogs();
   const styles = useMemo(() => MODEL_PICKER_COLORS[colorScheme], [colorScheme]);
 
   const loadDownloadedModels = useCallback(async () => {
+    const requestId = ++loadDownloadedModelsRequestRef.current;
+
     try {
       let downloaded = new Set<string>();
       if (modelType === "whisper") {
@@ -87,46 +96,76 @@ export default function LocalModelPicker({
           );
         }
       }
-      setDownloadedModels(downloaded);
-      return downloaded;
+      if (requestId === loadDownloadedModelsRequestRef.current) {
+        setDownloadedModels(downloaded);
+        return downloaded;
+      }
+      return null;
     } catch (error) {
       console.error("Failed to load downloaded models:", error);
-      return new Set<string>();
+      return null;
     }
   }, [modelType]);
 
   useEffect(() => {
     const initAndValidate = async () => {
       const downloaded = await loadDownloadedModels();
-      if (selectedModel && !downloaded.has(selectedModel)) {
+      // Only clear ids this picker owns — a foreign id (e.g. a cloud model)
+      // must survive untouched.
+      if (
+        downloaded &&
+        selectedModel &&
+        knownModelIds.has(selectedModel) &&
+        !downloaded.has(selectedModel)
+      ) {
         onModelSelect("");
       }
     };
     initAndValidate();
-  }, [loadDownloadedModels, selectedModel, onModelSelect]);
+  }, [loadDownloadedModels, selectedModel, onModelSelect, knownModelIds]);
 
-  const handleDownloadComplete = useCallback(() => {
-    loadDownloadedModels();
-    onDownloadComplete?.();
+  const handleDownloadComplete = useCallback(async () => {
+    await loadDownloadedModels();
+    await onDownloadComplete?.();
   }, [loadDownloadedModels, onDownloadComplete]);
 
   const {
-    downloadingModel,
-    downloadProgress,
+    downloads,
     downloadModel,
     deleteModel,
     isDownloadingModel,
     cancelDownload,
-    isCancelling,
+    isCancellingModel,
   } = useModelDownload({
     modelType,
     onDownloadComplete: handleDownloadComplete,
     onModelsCleared: loadDownloadedModels,
   });
 
+  const allModels = useMemo(() => providers.flatMap((provider) => provider.models), [providers]);
+  const selectionStateRef = useRef({ selectedModel, downloadedModels, knownModelIds });
+
+  useEffect(() => {
+    selectionStateRef.current = { selectedModel, downloadedModels, knownModelIds };
+  }, [selectedModel, downloadedModels, knownModelIds]);
+
   const handleDownload = useCallback(
     (modelId: string) => {
-      downloadModel(modelId, onModelSelect);
+      const selectedWhenStarted = selectionStateRef.current.selectedModel;
+
+      downloadModel(modelId, (downloadedId) => {
+        const {
+          selectedModel: current,
+          downloadedModels: downloaded,
+          knownModelIds: known,
+        } = selectionStateRef.current;
+        if (current !== selectedWhenStarted) return;
+
+        const selectionGone = known.has(current) && !downloaded.has(current);
+        if (!current || selectionGone) {
+          onModelSelect(downloadedId);
+        }
+      });
     },
     [downloadModel, onModelSelect]
   );
@@ -145,52 +184,59 @@ export default function LocalModelPicker({
 
   const currentProvider = providers.find((p) => p.id === selectedProvider);
   const models = useMemo(() => currentProvider?.models || [], [currentProvider?.models]);
-
-  const progressDisplay = useMemo(() => {
-    if (!downloadingModel) return null;
-
-    const modelName = models.find((m) => m.id === downloadingModel)?.name || downloadingModel;
-
-    return <DownloadProgressBar modelName={modelName} progress={downloadProgress} />;
-  }, [downloadingModel, downloadProgress, models]);
+  const activeModels = allModels.filter((model) => downloads[model.id]);
 
   return (
-    <div className={`${styles.container} ${className}`}>
+    <div className={className}>
       <ProviderTabs
         providers={providers}
         selectedId={selectedProvider}
         onSelect={onProviderSelect}
         colorScheme={colorScheme}
-        scrollable
+        wrap
       />
 
-      {progressDisplay}
+      {activeModels.length > 0 && (
+        <div className="space-y-2">
+          {activeModels.map((model) => {
+            const status = downloads[model.id];
+            return (
+              <DownloadProgressBar
+                key={model.id}
+                modelName={model.name}
+                progress={{
+                  percentage: status.progress,
+                  downloadedBytes: status.downloadedBytes,
+                  totalBytes: status.totalBytes,
+                }}
+                isInstalling={status.phase === "installing"}
+              />
+            );
+          })}
+        </div>
+      )}
 
-      <div className="p-3">
+      <div className="mt-2">
         <h5 className={`${styles.header} mb-2`}>{t("common.availableModels")}</h5>
 
         <ModelCardList
-          models={models.map(
-            (model): ModelCardOption => ({
-              value: model.id,
-              label: model.name,
-              description: model.descriptionKey
-                ? `${model.size} · ${t(model.descriptionKey, { defaultValue: model.description })}`
-                : model.size,
-              icon: getProviderIcon(selectedProvider),
-              invertInDark: isMonochromeProvider(selectedProvider),
-              recommended: model.recommended,
-              isDownloaded:
-                downloadedModels.has(model.id) || model.isDownloaded || model.downloaded,
-              isDownloading: isDownloadingModel(model.id),
-            })
-          )}
+          models={models.map((model): ModelCardOption => ({
+            value: model.id,
+            label: model.name,
+            description: model.size,
+            specUrl: model.specUrl,
+            icon: getProviderIcon(selectedProvider),
+            invertInDark: isMonochromeProvider(selectedProvider),
+            recommended: model.recommended,
+            isDownloaded: downloadedModels.has(model.id) || model.isDownloaded || model.downloaded,
+            isDownloading: isDownloadingModel(model.id),
+            isCancelling: isCancellingModel(model.id),
+          }))}
           selectedModel={selectedModel}
           onModelSelect={onModelSelect}
           onDownload={handleDownload}
           onDelete={handleDelete}
           onCancelDownload={cancelDownload}
-          isCancelling={isCancelling}
           colorScheme={colorScheme}
         />
       </div>

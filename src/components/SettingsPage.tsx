@@ -2,6 +2,7 @@ import React, { useState, useCallback, useEffect, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { Button } from "./ui/button";
 import { Input } from "./ui/input";
+import { BIDI_VALUE_TOKEN, BidiInterpolatedText } from "./ui/BidiInterpolatedText";
 import { Badge } from "./ui/badge";
 import {
   RefreshCw,
@@ -16,6 +17,9 @@ import {
   Monitor,
   Cloud,
   Key,
+  Cpu,
+  Network,
+  ShieldCheck,
   Sparkles,
   AlertTriangle,
   Loader2,
@@ -27,14 +31,26 @@ import {
   BookOpen,
   Copy,
   Trash2,
-} from "lucide-react";
+  Info,
+  MessageSquare,
+  FileAudio,
+  Wand2,
+  Upload,
+  Languages,
+} from "./icons";
 import { useAuth } from "../hooks/useAuth";
-import { NEON_AUTH_URL, signOut, deleteAccount } from "../lib/neonAuth";
+import { AUTH_URL, signOut } from "../lib/auth";
+import { deleteAccount } from "../lib/accountDeletionRequest";
+import { executeAccountDeletion } from "../lib/accountDeletionFlow";
+import { getValidatedAuthGeneration } from "../lib/authRequestContext";
+import { useBillingPortal } from "../hooks/useBillingPortal";
 import MicPermissionWarning from "./ui/MicPermissionWarning";
 import MicrophoneSettings from "./ui/MicrophoneSettings";
 import PermissionCard from "./ui/PermissionCard";
 import PasteToolsInfo from "./ui/PasteToolsInfo";
+import NixOsPasteInfo from "./ui/NixOsPasteInfo";
 import TranscriptionModelPicker from "./TranscriptionModelPicker";
+import SelfHostedPanel from "./SelfHostedPanel";
 import {
   ConfirmDialog,
   AlertDialog,
@@ -48,7 +64,8 @@ import {
 import { Alert, AlertTitle, AlertDescription } from "./ui/alert";
 import { useSettings } from "../hooks/useSettings";
 import { useDialogs } from "../hooks/useDialogs";
-import { useAgentName } from "../utils/agentName";
+import { useInsightsSyncOptIn } from "../hooks/useInsightsSyncOptIn";
+import { useLeaderboardParticipation } from "../hooks/useLeaderboardParticipation";
 import { useWhisper } from "../hooks/useWhisper";
 import { usePermissions } from "../hooks/usePermissions";
 import { useSystemAudioPermission } from "../hooks/useSystemAudioPermission";
@@ -56,53 +73,111 @@ import { useClipboard } from "../hooks/useClipboard";
 import { useUpdater } from "../hooks/useUpdater";
 
 import PromptStudio from "./ui/PromptStudio";
-import ReasoningModelSelector from "./ReasoningModelSelector";
-import { HotkeyInput } from "./ui/HotkeyInput";
+import { ProviderTabs } from "./ui/ProviderTabs";
+import { HotkeyListInput } from "./ui/HotkeyListInput";
 import { useHotkeyRegistration } from "../hooks/useHotkeyRegistration";
+import { useHotkeyModeInfo } from "../hooks/useHotkeyModeInfo";
+import { useLocalStorage } from "../hooks/useLocalStorage";
 import { validateHotkeyForSlot } from "../utils/hotkeyValidation";
 import { getPlatform, getCachedPlatform } from "../utils/platform";
-import { getDefaultHotkey, formatHotkeyLabel } from "../utils/hotkeys";
+import { formatHotkeyLabel } from "../utils/hotkeys";
+import {
+  getLinuxPasteInstallCommands,
+  needsLinuxPasteToolGuidance,
+} from "../utils/linuxPasteTools";
 import { ActivationModeSelector } from "./ui/ActivationModeSelector";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "./ui/select";
+import LinuxPttSetupInfo from "./ui/LinuxPttSetupInfo";
 import { Toggle } from "./ui/toggle";
 import DeveloperSection from "./DeveloperSection";
-import AgentModeSettings from "./settings/AgentModeSettings";
+import ChatAgentSettings from "./settings/ChatAgentSettings";
+import DictationAgentSettings from "./settings/DictationAgentSettings";
+import DictationTranslationSettings from "./settings/DictationTranslationSettings";
+import InferenceConfigEditor from "./settings/InferenceConfigEditor";
+import { MeetingTranscriptionPanel } from "./settings/MeetingSettings";
+import { UploadTranscriptionPanel } from "./settings/UploadSettings";
 import LanguageSelector from "./ui/LanguageSelector";
 import { Skeleton } from "./ui/skeleton";
 import { Progress } from "./ui/progress";
-import { useToast } from "./ui/Toast";
+import { useToast } from "./ui/useToast";
 import { useTheme } from "../hooks/useTheme";
-import type { LocalTranscriptionProvider } from "../types/electron";
+import { useStartOnboarding } from "../hooks/useStartOnboarding";
+import type {
+  ChineseScriptPreference,
+  GpuDevice,
+  LocalTranscriptionProvider,
+  InferenceMode,
+} from "../types/electron";
 import logger from "../utils/logger";
-import { SettingsRow } from "./ui/SettingsSection";
+import { SettingsRow, InferenceModeSelector } from "./ui/SettingsSection";
+import type { InferenceModeOption } from "./ui/SettingsSection";
+import { useSettingsLayout } from "./ui/useSettingsLayout";
 import { useUsage } from "../hooks/useUsage";
 import { cn } from "./lib/utils";
-import { startMigration, useMigration } from "../stores/noteStore.js";
+import { GRADIENT_CIRCLE } from "./ui/gradientCircle";
+import { Popover, PopoverContent, PopoverTrigger } from "./ui/popover";
+import {
+  startMigration,
+  useMigration,
+  loadFolders,
+  initializeNotesTree,
+} from "../stores/noteStore.js";
+import { syncService } from "../services/SyncService.js";
 import { formatBytes } from "../utils/formatBytes";
-import { useSettingsStore } from "../stores/settingsStore";
-
-const formatAmount = (cents: number, currency: string) =>
-  (cents / 100).toLocaleString(undefined, { style: "currency", currency });
+import {
+  clearMissingLocalModelSelections,
+  TRANSCRIPTION_ENTERPRISE_POLICY_PROVIDER_IDS,
+  TRANSCRIPTION_POLICY_PROVIDER_IDS,
+  useSettingsStore,
+} from "../stores/settingsStore";
+import { useWorkspaceStore } from "../stores/workspaceStore";
+import { highestPlan } from "../lib/usageStore";
+import { decideProPlanCardCta } from "../lib/upsell";
+import {
+  canChangeCloudBackupPreference,
+  effectiveAudioRetentionDays,
+  effectiveLocalHistoryEnabled,
+  isAgentAllowed,
+  isCloudBackupAllowed,
+  isEnterpriseTranscriptionOfferable,
+  lockedLocalHistoryValue,
+  maxAudioRetentionDays,
+} from "../stores/policyRules";
+import { usePolicyModeOptions, usePolicySnapshot } from "../hooks/usePolicy";
+import { usePolicyStore } from "../stores/policyStore";
+import { canManageSystemAudioInApp } from "../utils/systemAudioAccess";
+import WorkspaceSection from "./settings/WorkspaceSection";
+import { enterpriseTileCta, type EnterpriseTileCta } from "../lib/workspaceBilling";
+import WorkspaceBillingOverview from "./settings/WorkspaceBillingOverview";
+import EnterpriseCheckoutDialog from "./settings/EnterpriseCheckoutDialog";
+import CreateWorkspaceDialog from "./CreateWorkspaceDialog";
+import ProfileSection from "./settings/ProfileSection";
+import { formatAmount } from "../utils/formatAmount";
+import { enterpriseProviderName, getTranscriptionProvider } from "../models/ModelRegistry";
+import { useManagedScopeResolution } from "../stores/enterpriseIdentityStore";
+import { supportsLiveTranscriptionPreview } from "../utils/transcriptionPreview";
 
 export type SettingsSectionType =
   | "account"
   | "plansBilling"
+  | "workspace"
   | "general"
   | "hotkeys"
-  | "transcription"
-  | "intelligence"
+  | "speechToText"
+  | "llms"
   | "privacyData"
-  | "system"
-  | "aiModels"
-  | "agentConfig"
-  | "prompts"
-  | "agentMode";
+  | "system";
 
 interface SettingsPageProps {
   activeSection?: SettingsSectionType;
+  onNavigateToSection?: (section: SettingsSectionType) => void;
+  /** When a legacy section ID was used (e.g. `meetings`), land on the matching sub-tab. */
+  initialSubTab?: string;
 }
 
 const UI_LANGUAGE_OPTIONS: import("./ui/LanguageSelector").LanguageOption[] = [
   { value: "en", label: "English", flag: "🇺🇸" },
+  { value: "ar", label: "العربية", flag: "🇦🇪" },
   { value: "es", label: "Español", flag: "🇪🇸" },
   { value: "fr", label: "Français", flag: "🇫🇷" },
   { value: "de", label: "Deutsch", flag: "🇩🇪" },
@@ -114,6 +189,13 @@ const UI_LANGUAGE_OPTIONS: import("./ui/LanguageSelector").LanguageOption[] = [
   { value: "zh-TW", label: "繁體中文", flag: "🇹🇼" },
 ];
 
+const RETENTION_DAY_OPTIONS = [1, 7, 14, 30, 60, 90];
+
+const RETENTION_SELECT_CLASS =
+  "h-7 rounded border border-border/70 bg-surface-1/80 px-2.5 text-xs font-medium text-foreground shadow-sm backdrop-blur-sm hover:border-border-hover hover:bg-surface-2/70 focus:outline-none focus:ring-2 focus:ring-ring/30 focus:ring-offset-1 disabled:cursor-not-allowed disabled:opacity-50 transition-colors duration-200";
+
+const noop = () => {};
+
 function SettingsPanel({
   children,
   className = "",
@@ -123,7 +205,7 @@ function SettingsPanel({
 }) {
   return (
     <div
-      className={`rounded-lg border border-border/50 dark:border-border-subtle/70 bg-card/50 dark:bg-surface-2/50 backdrop-blur-sm divide-y divide-border/30 dark:divide-border-subtle/50 ${className}`}
+      className={`rounded-lg border border-border/70 dark:border-border-subtle/70 bg-card/50 dark:bg-surface-2/50 backdrop-blur-sm divide-y divide-border/60 dark:divide-border-subtle/50 ${className}`}
     >
       {children}
     </div>
@@ -137,22 +219,273 @@ function SettingsPanelRow({
   children: React.ReactNode;
   className?: string;
 }) {
-  return <div className={`px-4 py-3 ${className}`}>{children}</div>;
+  const { isCompact } = useSettingsLayout();
+
+  return (
+    <div className={`${isCompact ? "px-3 py-2.5" : "px-4 py-3"} ${className}`}>{children}</div>
+  );
 }
 
-function SectionHeader({ title, description }: { title: string; description?: string }) {
+function SectionHeader({
+  title,
+  description,
+  note,
+}: {
+  title: string;
+  description?: string;
+  note?: string;
+}) {
   return (
     <div className="mb-3">
       <h3 className="text-xs font-semibold text-foreground tracking-tight">{title}</h3>
       {description && (
         <p className="text-xs text-muted-foreground/80 mt-0.5 leading-relaxed">{description}</p>
       )}
+      {note && <p className="text-xs text-muted-foreground/80 mt-0.5 leading-relaxed">{note}</p>}
+    </div>
+  );
+}
+
+interface GranolaImportPreview {
+  total: number;
+  newCount: number;
+  duplicateCount: number;
+  sampleTitles: string[];
+  warningCount: number;
+}
+
+type GranolaImportState =
+  | { phase: "idle" }
+  | { phase: "picking" }
+  | { phase: "preview"; preview: GranolaImportPreview }
+  | { phase: "importing"; preview: GranolaImportPreview }
+  | { phase: "done"; imported: number; skipped: number };
+
+function GranolaImportSection({
+  showAlertDialog,
+}: {
+  showAlertDialog: (options: { title: string; description?: string }) => void;
+}) {
+  const { t } = useTranslation();
+  const [state, setState] = useState<GranolaImportState>({ phase: "idle" });
+  // Guards double-clicks: handlers read stale closure state, so state alone
+  // can't prevent a second dialog/run being started in the same frame.
+  const requestInFlightRef = useRef(false);
+
+  const errorDescription = (code?: string) => {
+    switch (code) {
+      case "EMPTY_FILE":
+        return t("settings.granolaImport.error.EMPTY_FILE");
+      case "HEADERS_UNRECOGNIZED":
+        return t("settings.granolaImport.error.HEADERS_UNRECOGNIZED");
+      case "NO_DATA_ROWS":
+        return t("settings.granolaImport.error.NO_DATA_ROWS");
+      case "FILE_TOO_LARGE":
+        return t("settings.granolaImport.error.FILE_TOO_LARGE");
+      default:
+        return t("settings.granolaImport.error.generic");
+    }
+  };
+
+  const showImportError = (code?: string) => {
+    showAlertDialog({
+      title: t("settings.granolaImport.error.title"),
+      description: errorDescription(code),
+    });
+  };
+
+  const handleChooseFile = async () => {
+    if (requestInFlightRef.current) return;
+    requestInFlightRef.current = true;
+    setState({ phase: "picking" });
+    try {
+      let result:
+        | Awaited<ReturnType<NonNullable<typeof window.electronAPI.granolaImportPickAndPreview>>>
+        | undefined;
+      try {
+        result = await window.electronAPI?.granolaImportPickAndPreview?.();
+      } catch {
+        setState({ phase: "idle" });
+        showImportError();
+        return;
+      }
+      if (!result || result.canceled) {
+        setState({ phase: "idle" });
+        return;
+      }
+      if (!result.success) {
+        setState({ phase: "idle" });
+        showImportError(result.error);
+        return;
+      }
+      setState({
+        phase: "preview",
+        preview: {
+          total: result.total ?? 0,
+          newCount: result.newCount ?? 0,
+          duplicateCount: result.duplicateCount ?? 0,
+          sampleTitles: result.sampleTitles ?? [],
+          warningCount: result.rowIssueCount ?? 0,
+        },
+      });
+    } finally {
+      requestInFlightRef.current = false;
+    }
+  };
+
+  const handleConfirm = async () => {
+    if (state.phase !== "preview" || requestInFlightRef.current) return;
+    requestInFlightRef.current = true;
+    setState({ phase: "importing", preview: state.preview });
+    try {
+      let result:
+        Awaited<ReturnType<NonNullable<typeof window.electronAPI.granolaImportRun>>> | undefined;
+      try {
+        result = await window.electronAPI?.granolaImportRun?.();
+      } catch {
+        result = undefined;
+      }
+      if (!result?.success) {
+        setState({ phase: "idle" });
+        showImportError(result?.error);
+        return;
+      }
+      const imported = result.imported ?? 0;
+      setState({ phase: "done", imported, skipped: result.skipped ?? 0 });
+      if (imported > 0) {
+        // One refresh + one batched sync pass — never per-note pushes.
+        void loadFolders();
+        void initializeNotesTree();
+        void syncService.requestSyncAll("manual");
+      }
+    } finally {
+      requestInFlightRef.current = false;
+    }
+  };
+
+  const dialogOpen =
+    state.phase === "preview" || state.phase === "importing" || state.phase === "done";
+  const preview = state.phase === "preview" || state.phase === "importing" ? state.preview : null;
+
+  return (
+    <div>
+      <SectionHeader
+        title={t("settings.granolaImport.title")}
+        description={t("settings.granolaImport.howTo")}
+      />
+      <SettingsPanel>
+        <SettingsPanelRow>
+          <SettingsRow
+            label={t("settings.granolaImport.title")}
+            description={t("settings.granolaImport.description")}
+          >
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-7 text-xs"
+              disabled={state.phase === "picking"}
+              onClick={handleChooseFile}
+            >
+              {state.phase === "picking" ? (
+                <Loader2 className="h-3 w-3 animate-spin" />
+              ) : (
+                t("settings.granolaImport.chooseFile")
+              )}
+            </Button>
+          </SettingsRow>
+        </SettingsPanelRow>
+      </SettingsPanel>
+
+      <Dialog
+        open={dialogOpen}
+        onOpenChange={(open) => {
+          if (!open && state.phase !== "importing") setState({ phase: "idle" });
+        }}
+      >
+        <DialogContent className="sm:max-w-90">
+          <DialogHeader>
+            <DialogTitle>
+              {state.phase === "done"
+                ? t("settings.granolaImport.done.title")
+                : t("settings.granolaImport.preview.title")}
+            </DialogTitle>
+            {state.phase === "done" ? (
+              <DialogDescription>
+                {t("settings.granolaImport.done.summary", {
+                  imported: state.imported,
+                  skipped: state.skipped,
+                })}
+              </DialogDescription>
+            ) : (
+              preview && (
+                <DialogDescription>
+                  {preview.newCount === 0
+                    ? t("settings.granolaImport.preview.nothingNew")
+                    : t("settings.granolaImport.preview.summary", {
+                        total: preview.total,
+                        newCount: preview.newCount,
+                        duplicateCount: preview.duplicateCount,
+                      })}
+                </DialogDescription>
+              )
+            )}
+          </DialogHeader>
+          {preview && (
+            <div className="space-y-2">
+              {preview.sampleTitles.length > 0 && (
+                <ul className="text-xs text-muted-foreground space-y-1">
+                  {preview.sampleTitles.map((title, index) => (
+                    <li key={`${index}-${title}`} className="truncate">
+                      {title}
+                    </li>
+                  ))}
+                </ul>
+              )}
+              {preview.warningCount > 0 && (
+                <p className="text-xs text-muted-foreground/80">
+                  {t("settings.granolaImport.preview.warnings", {
+                    warningCount: preview.warningCount,
+                  })}
+                </p>
+              )}
+            </div>
+          )}
+          <DialogFooter>
+            {state.phase === "done" ? (
+              <Button size="sm" onClick={() => setState({ phase: "idle" })}>
+                {t("common.close")}
+              </Button>
+            ) : (
+              <>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={state.phase === "importing"}
+                  onClick={() => setState({ phase: "idle" })}
+                >
+                  {t("common.cancel")}
+                </Button>
+                <Button size="sm" disabled={state.phase === "importing"} onClick={handleConfirm}>
+                  {state.phase === "importing" ? (
+                    <Loader2 className="h-3 w-3 animate-spin" />
+                  ) : (
+                    t("settings.granolaImport.preview.confirm", {
+                      newCount: preview?.newCount ?? 0,
+                    })
+                  )}
+                </Button>
+              </>
+            )}
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
 
 interface TranscriptionSectionProps {
   isSignedIn: boolean;
+  startOnboarding: () => void;
   cloudTranscriptionMode: string;
   setCloudTranscriptionMode: (mode: string) => void;
   useLocalWhisper: boolean;
@@ -168,16 +501,18 @@ interface TranscriptionSectionProps {
   setWhisperModel: (model: string) => void;
   parakeetModel: string;
   setParakeetModel: (model: string) => void;
-  openaiApiKey: string;
-  setOpenaiApiKey: (key: string) => void;
-  groqApiKey: string;
-  setGroqApiKey: (key: string) => void;
-  mistralApiKey: string;
-  setMistralApiKey: (key: string) => void;
-  customTranscriptionApiKey: string;
-  setCustomTranscriptionApiKey: (key: string) => void;
+  cohereModel: string;
+  setCohereModel: (model: string) => void;
   cloudTranscriptionBaseUrl?: string;
   setCloudTranscriptionBaseUrl: (url: string) => void;
+  transcriptionMode: InferenceMode;
+  setTranscriptionMode: (mode: InferenceMode) => void;
+  remoteTranscriptionUrl: string;
+  setRemoteTranscriptionUrl: (url: string) => void;
+  remoteTranscriptionModel: string;
+  setRemoteTranscriptionModel: (model: string) => void;
+  showTranscriptionPreview: boolean;
+  setShowTranscriptionPreview: (value: boolean) => void;
   toast: (opts: {
     title: string;
     description: string;
@@ -188,6 +523,7 @@ interface TranscriptionSectionProps {
 
 function TranscriptionSection({
   isSignedIn,
+  startOnboarding,
   cloudTranscriptionMode,
   setCloudTranscriptionMode,
   useLocalWhisper,
@@ -203,221 +539,293 @@ function TranscriptionSection({
   setWhisperModel,
   parakeetModel,
   setParakeetModel,
-  openaiApiKey,
-  setOpenaiApiKey,
-  groqApiKey,
-  setGroqApiKey,
-  mistralApiKey,
-  setMistralApiKey,
-  customTranscriptionApiKey,
-  setCustomTranscriptionApiKey,
+  cohereModel,
+  setCohereModel,
   cloudTranscriptionBaseUrl,
   setCloudTranscriptionBaseUrl,
+  transcriptionMode,
+  setTranscriptionMode,
+  remoteTranscriptionUrl,
+  setRemoteTranscriptionUrl,
+  remoteTranscriptionModel,
+  setRemoteTranscriptionModel,
+  showTranscriptionPreview,
+  setShowTranscriptionPreview,
   toast,
 }: TranscriptionSectionProps) {
   const { t } = useTranslation();
-  const isCustomMode = cloudTranscriptionMode === "byok" || useLocalWhisper;
-  const isCloudMode = isSignedIn && cloudTranscriptionMode === "openwhispr" && !useLocalWhisper;
+  const policySnapshot = usePolicySnapshot();
+  const enterpriseTranscriptionSetupMode = useSettingsStore(
+    (s) => s.enterpriseTranscriptionSetupMode
+  );
+  const setEnterpriseTranscriptionSetupMode = useSettingsStore(
+    (s) => s.setEnterpriseTranscriptionSetupMode
+  );
+  const managed = useManagedScopeResolution("transcription", enterpriseTranscriptionSetupMode);
+  const managedAvailable = useManagedScopeResolution("transcription", "managed");
+  const {
+    modes: transcriptionModes,
+    effectiveMode: effectiveTranscriptionMode,
+    isModeAllowed,
+  } = usePolicyModeOptions<InferenceModeOption>(
+    [
+      {
+        id: "openwhispr",
+        label: t("settingsPage.transcription.modes.openwhispr"),
+        description: t("settingsPage.transcription.modes.openwhisprDesc"),
+        icon: <Cloud className="w-4 h-4" />,
+        disabled: !isSignedIn,
+        badge: !isSignedIn ? t("common.freeAccountRequired") : undefined,
+      },
+      {
+        id: "providers",
+        label: t("settingsPage.transcription.modes.providers"),
+        description: t("settingsPage.transcription.modes.providersDesc"),
+        icon: <Key className="w-4 h-4" />,
+      },
+      {
+        id: "local",
+        label: t("settingsPage.transcription.modes.local"),
+        description: t("settingsPage.transcription.modes.localDesc"),
+        icon: <Cpu className="w-4 h-4" />,
+      },
+      {
+        id: "self-hosted",
+        label: t("settingsPage.transcription.modes.selfHosted"),
+        description: t("settingsPage.transcription.modes.selfHostedDesc"),
+        icon: <Network className="w-4 h-4" />,
+      },
+      ...(isEnterpriseTranscriptionOfferable(policySnapshot)
+        ? [
+            {
+              id: "enterprise" as const,
+              label: t("settingsPage.transcription.modes.enterprise"),
+              description: t("settingsPage.transcription.modes.enterpriseDesc"),
+              icon: <ShieldCheck className="w-4 h-4" />,
+            },
+          ]
+        : []),
+    ],
+    "transcription",
+    transcriptionMode,
+    {
+      byokProviders: TRANSCRIPTION_POLICY_PROVIDER_IDS,
+      enterpriseProviders: TRANSCRIPTION_ENTERPRISE_POLICY_PROVIDER_IDS,
+    }
+  );
+  const handleTranscriptionModeSelect = (mode: InferenceMode) => {
+    if (!isModeAllowed(mode)) return;
+    if (mode === "openwhispr" && !isSignedIn) {
+      startOnboarding();
+      return;
+    }
+    if (mode === effectiveTranscriptionMode) return;
+    setTranscriptionMode(mode);
+    setUseLocalWhisper(mode === "local");
+    updateTranscriptionSettings({ useLocalWhisper: mode === "local" });
+    setCloudTranscriptionMode(mode === "openwhispr" ? "openwhispr" : "byok");
+    if (mode === "enterprise") setEnterpriseTranscriptionSetupMode("managed");
+
+    const toastKey = {
+      openwhispr: "switchedCloud",
+      providers: "switchedProviders",
+      local: "switchedLocal",
+      "self-hosted": "switchedSelfHosted",
+      enterprise: "switchedEnterprise",
+    }[mode];
+    toast({
+      title: t(`settingsPage.transcription.toasts.${toastKey}.title`),
+      description: t(`settingsPage.transcription.toasts.${toastKey}.description`),
+      variant: "success",
+      duration: 3000,
+    });
+  };
+
+  const handleLocalModelSelect = useCallback(
+    (modelId: string, providerId?: string) => {
+      const provider = providerId ?? localTranscriptionProvider;
+      if (provider === "nvidia") {
+        setParakeetModel(modelId);
+      } else if (provider === "cohere") {
+        setCohereModel(modelId);
+      } else {
+        setWhisperModel(modelId);
+      }
+    },
+    [localTranscriptionProvider, setParakeetModel, setCohereModel, setWhisperModel]
+  );
+
+  const selectedCloudModelStreams = Boolean(
+    getTranscriptionProvider(cloudTranscriptionProvider)?.models.some(
+      (model) => model.id === cloudTranscriptionModel && model.streaming
+    )
+  );
+  const previewAvailable = supportsLiveTranscriptionPreview(
+    effectiveTranscriptionMode,
+    selectedCloudModelStreams
+  );
+
+  const renderPreviewToggle = () => (
+    <SettingsPanel>
+      <SettingsPanelRow>
+        <SettingsRow
+          label={t("settingsPage.transcription.transcriptionPreview")}
+          description={t("settingsPage.transcription.transcriptionPreviewDescription")}
+        >
+          <Toggle checked={showTranscriptionPreview} onChange={setShowTranscriptionPreview} />
+        </SettingsRow>
+      </SettingsPanelRow>
+    </SettingsPanel>
+  );
+
+  const renderTranscriptionPicker = (mode?: "cloud" | "local") => (
+    <TranscriptionModelPicker
+      selectedCloudProvider={cloudTranscriptionProvider}
+      onCloudProviderSelect={setCloudTranscriptionProvider}
+      selectedCloudModel={cloudTranscriptionModel}
+      onCloudModelSelect={setCloudTranscriptionModel}
+      selectedLocalModel={
+        localTranscriptionProvider === "nvidia"
+          ? parakeetModel
+          : localTranscriptionProvider === "cohere"
+            ? cohereModel
+            : whisperModel
+      }
+      onLocalModelSelect={handleLocalModelSelect}
+      selectedLocalProvider={localTranscriptionProvider}
+      onLocalProviderSelect={setLocalTranscriptionProvider}
+      useLocalWhisper={mode === "local" || (!mode && useLocalWhisper)}
+      onModeChange={
+        mode
+          ? noop
+          : (isLocal) => {
+              setUseLocalWhisper(isLocal);
+              updateTranscriptionSettings({ useLocalWhisper: isLocal });
+              if (isLocal) setCloudTranscriptionMode("byok");
+            }
+      }
+      mode={mode}
+      cloudTranscriptionBaseUrl={cloudTranscriptionBaseUrl}
+      setCloudTranscriptionBaseUrl={setCloudTranscriptionBaseUrl}
+      variant="settings"
+    />
+  );
+
+  // Local decoding still serves meetings and uploads under a managed-config
+  // error, so this stays a card alongside the rest of the section (including
+  // the GPU selector below) instead of an early return that hides it.
+  const errorCard =
+    managed.kind === "error" ? (
+      <div className="rounded-lg border border-destructive/30 bg-destructive/5 p-3" role="alert">
+        <div className="flex items-start gap-2">
+          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-destructive" />
+          <div>
+            <p className="text-sm font-medium">
+              {t("settingsPage.aiModels.managedEnterprise.errorTitle")}
+            </p>
+            <p className="mt-0.5 text-xs text-muted-foreground">
+              {managed.messageKey ? t(managed.messageKey) : managed.message}
+            </p>
+          </div>
+        </div>
+      </div>
+    ) : null;
+
+  const managedCard =
+    managed.kind === "managed" ? (
+      <div className="space-y-3 rounded-lg border border-primary/20 bg-primary/[0.03] p-3">
+        <div className="flex items-start gap-2.5">
+          <div className="rounded-md bg-primary/10 p-1.5 text-primary">
+            <ShieldCheck className="h-4 w-4" />
+          </div>
+          <div className="min-w-0 flex-1">
+            <p className="text-sm font-medium">
+              {t("settingsPage.aiModels.managedEnterprise.title")}
+            </p>
+            <p className="mt-0.5 text-xs text-muted-foreground">
+              {enterpriseProviderName(managed.provider)} ·{" "}
+              <span className="font-mono">{managed.model}</span>
+            </p>
+            <p className="mt-1 text-xs text-muted-foreground">
+              {t("settingsPage.aiModels.managedEnterprise.description")}
+            </p>
+          </div>
+        </div>
+        {managed.mode !== "managed_required" && managed.allowManualSetup && (
+          <div className="flex flex-wrap items-center gap-2 border-t border-border/70 pt-3">
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              onClick={() => setEnterpriseTranscriptionSetupMode("manual")}
+            >
+              {t("settingsPage.aiModels.managedEnterprise.usePersonalSetup")}
+            </Button>
+          </div>
+        )}
+      </div>
+    ) : null;
 
   return (
     <div className="space-y-4">
-      <SectionHeader
-        title={t("settingsPage.transcription.title")}
-        description={t("settingsPage.transcription.description")}
-      />
-
-      {/* Mode selector */}
-      {isSignedIn && (
-        <SettingsPanel>
-          <SettingsPanelRow>
-            <button
-              onClick={() => {
-                if (!isCloudMode) {
-                  setCloudTranscriptionMode("openwhispr");
-                  setUseLocalWhisper(false);
-                  updateTranscriptionSettings({ useLocalWhisper: false });
-                  toast({
-                    title: t("settingsPage.transcription.toasts.switchedCloud.title"),
-                    description: t("settingsPage.transcription.toasts.switchedCloud.description"),
-                    variant: "success",
-                    duration: 3000,
-                  });
-                }
-              }}
-              className="w-full flex items-center gap-3 text-left cursor-pointer group"
-            >
-              <div
-                className={`w-8 h-8 rounded-md flex items-center justify-center shrink-0 transition-colors ${
-                  isCloudMode
-                    ? "bg-primary/10 dark:bg-primary/15"
-                    : "bg-muted/60 dark:bg-surface-raised group-hover:bg-muted dark:group-hover:bg-surface-3"
-                }`}
-              >
-                <Cloud
-                  className={`w-4 h-4 transition-colors ${
-                    isCloudMode ? "text-primary" : "text-muted-foreground"
-                  }`}
-                />
-              </div>
-              <div className="flex-1 min-w-0">
-                <div className="flex items-center gap-2">
-                  <span className="text-xs font-medium text-foreground">
-                    {t("settingsPage.transcription.openwhisprCloud")}
-                  </span>
-                  {isCloudMode && (
-                    <span className="text-xs font-medium text-primary bg-primary/10 dark:bg-primary/15 px-1.5 py-px rounded-sm">
-                      {t("common.active")}
-                    </span>
-                  )}
-                </div>
-                <p className="text-xs text-muted-foreground/80 mt-0.5">
-                  {t("settingsPage.transcription.openwhisprCloudDescription")}
+      {errorCard}
+      {managedCard}
+      {!errorCard && !managedCard && (
+        <>
+          {enterpriseTranscriptionSetupMode === "manual" && managedAvailable.kind === "managed" && (
+            <div className="flex items-center justify-between gap-3 rounded-lg border bg-muted/30 p-3">
+              <div className="min-w-0">
+                <p className="text-sm font-medium">
+                  {t("settingsPage.aiModels.managedEnterprise.availableTitle")}
+                </p>
+                <p className="text-xs text-muted-foreground">
+                  {t("settingsPage.aiModels.managedEnterprise.availableDescription", {
+                    provider: enterpriseProviderName(managedAvailable.provider),
+                  })}
                 </p>
               </div>
-              <div
-                className={`w-4 h-4 rounded-full border-2 shrink-0 transition-colors ${
-                  isCloudMode
-                    ? "border-primary bg-primary"
-                    : "border-border-hover dark:border-border-subtle"
-                }`}
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className="shrink-0"
+                onClick={() => setEnterpriseTranscriptionSetupMode("managed")}
               >
-                {isCloudMode && (
-                  <div className="w-full h-full flex items-center justify-center">
-                    <div className="w-1.5 h-1.5 rounded-full bg-primary-foreground" />
-                  </div>
-                )}
-              </div>
-            </button>
-          </SettingsPanelRow>
-          <SettingsPanelRow>
-            <button
-              onClick={() => {
-                if (!isCustomMode) {
-                  setCloudTranscriptionMode("byok");
-                  setUseLocalWhisper(false);
-                  updateTranscriptionSettings({ useLocalWhisper: false });
-                  toast({
-                    title: t("settingsPage.transcription.toasts.switchedCustom.title"),
-                    description: t("settingsPage.transcription.toasts.switchedCustom.description"),
-                    variant: "success",
-                    duration: 3000,
-                  });
-                }
-              }}
-              className="w-full flex items-center gap-3 text-left cursor-pointer group"
-            >
-              <div
-                className={`w-8 h-8 rounded-md flex items-center justify-center shrink-0 transition-colors ${
-                  isCustomMode
-                    ? "bg-accent/10 dark:bg-accent/15"
-                    : "bg-muted/60 dark:bg-surface-raised group-hover:bg-muted dark:group-hover:bg-surface-3"
-                }`}
-              >
-                <Key
-                  className={`w-4 h-4 transition-colors ${
-                    isCustomMode ? "text-accent" : "text-muted-foreground"
-                  }`}
-                />
-              </div>
-              <div className="flex-1 min-w-0">
-                <div className="flex items-center gap-2">
-                  <span className="text-xs font-medium text-foreground">
-                    {t("settingsPage.transcription.customSetup")}
-                  </span>
-                  {isCustomMode && (
-                    <span className="text-xs font-medium text-accent bg-accent/10 dark:bg-accent/15 px-1.5 py-px rounded-sm">
-                      {t("common.active")}
-                    </span>
-                  )}
-                </div>
-                <p className="text-xs text-muted-foreground/80 mt-0.5">
-                  {t("settingsPage.transcription.customSetupDescription")}
-                </p>
-              </div>
-              <div
-                className={`w-4 h-4 rounded-full border-2 shrink-0 transition-colors ${
-                  isCustomMode
-                    ? "border-accent bg-accent"
-                    : "border-border-hover dark:border-border-subtle"
-                }`}
-              >
-                {isCustomMode && (
-                  <div className="w-full h-full flex items-center justify-center">
-                    <div className="w-1.5 h-1.5 rounded-full bg-accent-foreground" />
-                  </div>
-                )}
-              </div>
-            </button>
-          </SettingsPanelRow>
-        </SettingsPanel>
+                {t("settingsPage.aiModels.managedEnterprise.useManaged")}
+              </Button>
+            </div>
+          )}
+          <InferenceModeSelector
+            modes={transcriptionModes}
+            activeMode={effectiveTranscriptionMode}
+            onSelect={handleTranscriptionModeSelect}
+          />
+
+          {effectiveTranscriptionMode === "providers" && renderTranscriptionPicker("cloud")}
+          {effectiveTranscriptionMode === "local" && renderTranscriptionPicker("local")}
+          {previewAvailable && renderPreviewToggle()}
+
+          {effectiveTranscriptionMode === "self-hosted" && (
+            <SelfHostedPanel
+              service="transcription"
+              url={remoteTranscriptionUrl}
+              onUrlChange={setRemoteTranscriptionUrl}
+              model={remoteTranscriptionModel}
+              onModelChange={setRemoteTranscriptionModel}
+            />
+          )}
+        </>
       )}
 
-      {/* Custom Setup model picker — shown when Custom Setup is active or not signed in */}
-      {(isCustomMode || !isSignedIn) && (
-        <TranscriptionModelPicker
-          selectedCloudProvider={cloudTranscriptionProvider}
-          onCloudProviderSelect={setCloudTranscriptionProvider}
-          selectedCloudModel={cloudTranscriptionModel}
-          onCloudModelSelect={setCloudTranscriptionModel}
-          selectedLocalModel={
-            localTranscriptionProvider === "nvidia" ? parakeetModel : whisperModel
-          }
-          onLocalModelSelect={(modelId) => {
-            if (localTranscriptionProvider === "nvidia") {
-              setParakeetModel(modelId);
-            } else {
-              setWhisperModel(modelId);
-            }
-          }}
-          selectedLocalProvider={localTranscriptionProvider}
-          onLocalProviderSelect={setLocalTranscriptionProvider}
-          useLocalWhisper={useLocalWhisper}
-          onModeChange={(isLocal) => {
-            setUseLocalWhisper(isLocal);
-            updateTranscriptionSettings({ useLocalWhisper: isLocal });
-            if (isLocal) {
-              setCloudTranscriptionMode("byok");
-            }
-          }}
-          openaiApiKey={openaiApiKey}
-          setOpenaiApiKey={setOpenaiApiKey}
-          groqApiKey={groqApiKey}
-          setGroqApiKey={setGroqApiKey}
-          mistralApiKey={mistralApiKey}
-          setMistralApiKey={setMistralApiKey}
-          customTranscriptionApiKey={customTranscriptionApiKey}
-          setCustomTranscriptionApiKey={setCustomTranscriptionApiKey}
-          cloudTranscriptionBaseUrl={cloudTranscriptionBaseUrl}
-          setCloudTranscriptionBaseUrl={setCloudTranscriptionBaseUrl}
-          variant="settings"
-        />
-      )}
+      {/* Local decoding still serves meetings and uploads, so the GPU choice stays reachable. */}
+      <GpuDeviceSelector purpose="transcription" />
     </div>
   );
 }
 
 interface AiModelsSectionProps {
-  isSignedIn: boolean;
-  cloudReasoningMode: string;
-  setCloudReasoningMode: (mode: string) => void;
-  useReasoningModel: boolean;
-  setUseReasoningModel: (value: boolean) => void;
-  reasoningModel: string;
-  setReasoningModel: (model: string) => void;
-  reasoningProvider: string;
-  setReasoningProvider: (provider: string) => void;
-  cloudReasoningBaseUrl: string;
-  setCloudReasoningBaseUrl: (url: string) => void;
-  openaiApiKey: string;
-  setOpenaiApiKey: (key: string) => void;
-  anthropicApiKey: string;
-  setAnthropicApiKey: (key: string) => void;
-  geminiApiKey: string;
-  setGeminiApiKey: (key: string) => void;
-  groqApiKey: string;
-  setGroqApiKey: (key: string) => void;
-  customReasoningApiKey: string;
-  setCustomReasoningApiKey: (key: string) => void;
+  useCleanupModel: boolean;
+  setUseCleanupModel: (value: boolean) => void;
   toast: (opts: {
     title: string;
     description: string;
@@ -426,206 +834,342 @@ interface AiModelsSectionProps {
   }) => void;
 }
 
-function AiModelsSection({
-  isSignedIn,
-  cloudReasoningMode,
-  setCloudReasoningMode,
-  useReasoningModel,
-  setUseReasoningModel,
-  reasoningModel,
-  setReasoningModel,
-  reasoningProvider,
-  setReasoningProvider,
-  cloudReasoningBaseUrl,
-  setCloudReasoningBaseUrl,
-  openaiApiKey,
-  setOpenaiApiKey,
-  anthropicApiKey,
-  setAnthropicApiKey,
-  geminiApiKey,
-  setGeminiApiKey,
-  groqApiKey,
-  setGroqApiKey,
-  customReasoningApiKey,
-  setCustomReasoningApiKey,
-  toast,
-}: AiModelsSectionProps) {
+const CLEANUP_MODE_TOAST_KEY: Record<InferenceMode, string> = {
+  openwhispr: "switchedCloud",
+  providers: "switchedProviders",
+  local: "switchedLocal",
+  "self-hosted": "switchedSelfHosted",
+  enterprise: "switchedEnterprise",
+};
+
+function NoteFormattingSettings() {
   const { t } = useTranslation();
-  const isCustomMode = cloudReasoningMode === "byok";
-  const isCloudMode = isSignedIn && cloudReasoningMode === "openwhispr";
+  const autoGenerateNoteTitle = useSettingsStore((s) => s.autoGenerateNoteTitle);
+  const setAutoGenerateNoteTitle = useSettingsStore((s) => s.setAutoGenerateNoteTitle);
 
   return (
     <div className="space-y-4">
-      <SectionHeader
-        title={t("settingsPage.aiModels.title")}
-        description={t("settingsPage.aiModels.description")}
-      />
+      <SettingsPanel>
+        <SettingsPanelRow>
+          <SettingsRow
+            label={t("settingsPage.noteFormatting.autoGenerateTitle")}
+            description={t("settingsPage.noteFormatting.autoGenerateTitleDescription")}
+          >
+            <Toggle checked={autoGenerateNoteTitle} onChange={setAutoGenerateNoteTitle} />
+          </SettingsRow>
+        </SettingsPanelRow>
+      </SettingsPanel>
+      <InferenceConfigEditor scope="noteFormatting" />
+    </div>
+  );
+}
 
-      {/* Enable toggle — always at top */}
+function AiModelsSection({ useCleanupModel, setUseCleanupModel, toast }: AiModelsSectionProps) {
+  const { t } = useTranslation();
+
+  const handleCleanupModeChange = (mode: InferenceMode) => {
+    const toastKey = CLEANUP_MODE_TOAST_KEY[mode];
+    toast({
+      title: t(`settingsPage.aiModels.toasts.${toastKey}.title`),
+      description: t(`settingsPage.aiModels.toasts.${toastKey}.description`),
+      variant: "success",
+      duration: 3000,
+    });
+  };
+
+  return (
+    <div className="space-y-4">
       <SettingsPanel>
         <SettingsPanelRow>
           <SettingsRow
             label={t("settingsPage.aiModels.enableTextCleanup")}
             description={t("settingsPage.aiModels.enableTextCleanupDescription")}
           >
-            <Toggle checked={useReasoningModel} onChange={setUseReasoningModel} />
+            <Toggle checked={useCleanupModel} onChange={setUseCleanupModel} />
           </SettingsRow>
         </SettingsPanelRow>
       </SettingsPanel>
 
-      {useReasoningModel && (
+      {useCleanupModel && (
         <>
-          {/* Mode selector */}
-          {isSignedIn && (
-            <SettingsPanel>
-              <SettingsPanelRow>
-                <button
-                  onClick={() => {
-                    if (!isCloudMode) {
-                      setCloudReasoningMode("openwhispr");
-                      window.electronAPI?.llamaServerStop?.();
-                      toast({
-                        title: t("settingsPage.aiModels.toasts.switchedCloud.title"),
-                        description: t("settingsPage.aiModels.toasts.switchedCloud.description"),
-                        variant: "success",
-                        duration: 3000,
-                      });
-                    }
-                  }}
-                  className="w-full flex items-center gap-3 text-left cursor-pointer group"
-                >
-                  <div
-                    className={`w-8 h-8 rounded-md flex items-center justify-center shrink-0 transition-colors ${
-                      isCloudMode
-                        ? "bg-primary/10 dark:bg-primary/15"
-                        : "bg-muted/60 dark:bg-surface-raised group-hover:bg-muted dark:group-hover:bg-surface-3"
-                    }`}
-                  >
-                    <Cloud
-                      className={`w-4 h-4 transition-colors ${
-                        isCloudMode ? "text-primary" : "text-muted-foreground"
-                      }`}
-                    />
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <div className="flex items-center gap-2">
-                      <span className="text-xs font-medium text-foreground">
-                        {t("settingsPage.aiModels.openwhisprCloud")}
-                      </span>
-                      {isCloudMode && (
-                        <span className="text-xs font-medium text-primary bg-primary/10 dark:bg-primary/15 px-1.5 py-px rounded-sm">
-                          {t("common.active")}
-                        </span>
-                      )}
-                    </div>
-                    <p className="text-xs text-muted-foreground/80 mt-0.5">
-                      {t("settingsPage.aiModels.openwhisprCloudDescription")}
-                    </p>
-                  </div>
-                  <div
-                    className={`w-4 h-4 rounded-full border-2 shrink-0 transition-colors ${
-                      isCloudMode
-                        ? "border-primary bg-primary"
-                        : "border-border-hover dark:border-border-subtle"
-                    }`}
-                  >
-                    {isCloudMode && (
-                      <div className="w-full h-full flex items-center justify-center">
-                        <div className="w-1.5 h-1.5 rounded-full bg-primary-foreground" />
-                      </div>
-                    )}
-                  </div>
-                </button>
-              </SettingsPanelRow>
-              <SettingsPanelRow>
-                <button
-                  onClick={() => {
-                    if (!isCustomMode) {
-                      setCloudReasoningMode("byok");
-                      toast({
-                        title: t("settingsPage.aiModels.toasts.switchedCustom.title"),
-                        description: t("settingsPage.aiModels.toasts.switchedCustom.description"),
-                        variant: "success",
-                        duration: 3000,
-                      });
-                    }
-                  }}
-                  className="w-full flex items-center gap-3 text-left cursor-pointer group"
-                >
-                  <div
-                    className={`w-8 h-8 rounded-md flex items-center justify-center shrink-0 transition-colors ${
-                      isCustomMode
-                        ? "bg-accent/10 dark:bg-accent/15"
-                        : "bg-muted/60 dark:bg-surface-raised group-hover:bg-muted dark:group-hover:bg-surface-3"
-                    }`}
-                  >
-                    <Key
-                      className={`w-4 h-4 transition-colors ${
-                        isCustomMode ? "text-accent" : "text-muted-foreground"
-                      }`}
-                    />
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <div className="flex items-center gap-2">
-                      <span className="text-xs font-medium text-foreground">
-                        {t("settingsPage.aiModels.customSetup")}
-                      </span>
-                      {isCustomMode && (
-                        <span className="text-xs font-medium text-accent bg-accent/10 dark:bg-accent/15 px-1.5 py-px rounded-sm">
-                          {t("common.active")}
-                        </span>
-                      )}
-                    </div>
-                    <p className="text-xs text-muted-foreground/80 mt-0.5">
-                      {t("settingsPage.aiModels.customSetupDescription")}
-                    </p>
-                  </div>
-                  <div
-                    className={`w-4 h-4 rounded-full border-2 shrink-0 transition-colors ${
-                      isCustomMode
-                        ? "border-accent bg-accent"
-                        : "border-border-hover dark:border-border-subtle"
-                    }`}
-                  >
-                    {isCustomMode && (
-                      <div className="w-full h-full flex items-center justify-center">
-                        <div className="w-1.5 h-1.5 rounded-full bg-accent-foreground" />
-                      </div>
-                    )}
-                  </div>
-                </button>
-              </SettingsPanelRow>
-            </SettingsPanel>
-          )}
-
-          {/* Custom Setup model picker — shown when Custom Setup is active or not signed in */}
-          {(isCustomMode || !isSignedIn) && (
-            <ReasoningModelSelector
-              reasoningModel={reasoningModel}
-              setReasoningModel={setReasoningModel}
-              localReasoningProvider={reasoningProvider}
-              setLocalReasoningProvider={setReasoningProvider}
-              cloudReasoningBaseUrl={cloudReasoningBaseUrl}
-              setCloudReasoningBaseUrl={setCloudReasoningBaseUrl}
-              openaiApiKey={openaiApiKey}
-              setOpenaiApiKey={setOpenaiApiKey}
-              anthropicApiKey={anthropicApiKey}
-              setAnthropicApiKey={setAnthropicApiKey}
-              geminiApiKey={geminiApiKey}
-              setGeminiApiKey={setGeminiApiKey}
-              groqApiKey={groqApiKey}
-              setGroqApiKey={setGroqApiKey}
-              customReasoningApiKey={customReasoningApiKey}
-              setCustomReasoningApiKey={setCustomReasoningApiKey}
-            />
-          )}
+          <InferenceConfigEditor scope="dictationCleanup" onModeChange={handleCleanupModeChange} />
+          <GpuDeviceSelector purpose="intelligence" />
         </>
       )}
     </div>
   );
 }
 
-export default function SettingsPage({ activeSection = "general" }: SettingsPageProps) {
+type SpeechTab = "dictation" | "noteRecording" | "upload";
+type LlmTab =
+  | "dictationCleanup"
+  | "dictationAgent"
+  | "dictationTranslation"
+  | "noteFormatting"
+  | "chatIntelligence";
+
+const SPEECH_TABS: SpeechTab[] = ["dictation", "noteRecording", "upload"];
+const LLM_TABS: LlmTab[] = [
+  "dictationCleanup",
+  "dictationAgent",
+  "dictationTranslation",
+  "noteFormatting",
+  "chatIntelligence",
+];
+const AGENT_LLM_TABS = new Set<LlmTab>(["dictationAgent", "chatIntelligence"]);
+
+function useSubTab<T extends string>(storageKey: string, options: readonly T[], initial?: T) {
+  const [tab, setTab] = useLocalStorage<T>(storageKey, initial ?? options[0]);
+  useEffect(() => {
+    if (initial && initial !== tab) setTab(initial);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [initial]);
+  const safeTab = options.includes(tab) ? tab : options[0];
+  return [safeTab, setTab] as const;
+}
+
+function VADLabelWithInfo({ label, description }: { label: string; description: string }) {
+  return (
+    <div className="inline-flex items-center gap-1.5 text-xs font-medium text-foreground">
+      <span>{label}</span>
+      <Popover>
+        <PopoverTrigger asChild>
+          <button
+            type="button"
+            className="inline-flex items-center justify-center rounded-sm text-muted-foreground hover:text-foreground transition-colors"
+            aria-label={label}
+          >
+            <Info className="h-3.5 w-3.5" />
+          </button>
+        </PopoverTrigger>
+        <PopoverContent side="top" align="start" className="max-w-sm p-3">
+          <p className="text-xs leading-relaxed text-muted-foreground">{description}</p>
+        </PopoverContent>
+      </Popover>
+    </div>
+  );
+}
+
+function TabPanel({ active, children }: { active: boolean; children: React.ReactNode }) {
+  return <div className={active ? undefined : "hidden"}>{children}</div>;
+}
+
+// "Gabriel Stein" → "GS"; single names fall back to their first letter.
+function nameInitials(name: string): string {
+  const parts = name.trim().split(/\s+/);
+  const first = parts[0]?.[0] ?? "";
+  const last = parts.length > 1 ? (parts[parts.length - 1][0] ?? "") : "";
+  return (first + last).toUpperCase();
+}
+
+export function AccountAvatar({ image, name }: { image?: string | null; name: string }) {
+  // Same stale-URL fallback as MemberAvatar: OAuth-hosted images expire, and a
+  // bare <img> would render the broken-image glyph instead of the initials.
+  const [failedSrc, setFailedSrc] = useState<string | null>(null);
+  const initials = nameInitials(name);
+  return (
+    <div
+      className={cn(
+        "w-10 h-10 rounded-full flex items-center justify-center shrink-0 overflow-hidden",
+        GRADIENT_CIRCLE
+      )}
+    >
+      {image && image !== failedSrc ? (
+        <img
+          src={image}
+          alt={name}
+          loading="lazy"
+          referrerPolicy="no-referrer"
+          onError={() => setFailedSrc(image)}
+          className="w-10 h-10 rounded-full object-cover"
+        />
+      ) : initials ? (
+        <span className="text-[13px] font-semibold leading-none select-none">{initials}</span>
+      ) : (
+        <UserCircle className="w-5 h-5" />
+      )}
+    </div>
+  );
+}
+
+function SpeechToTextTabs({
+  initialTab,
+  renderDictation,
+  renderNoteRecording,
+  renderUpload,
+}: {
+  initialTab?: SpeechTab;
+  renderDictation: () => React.ReactNode;
+  renderNoteRecording: () => React.ReactNode;
+  renderUpload: () => React.ReactNode;
+}) {
+  const { t } = useTranslation();
+  const [tab, setTab] = useSubTab<SpeechTab>("settings.speechToTextTab", SPEECH_TABS, initialTab);
+
+  const subTabs = [
+    { id: "dictation", name: t("settingsPage.speechToText.tabs.dictation") },
+    { id: "noteRecording", name: t("settingsPage.speechToText.tabs.noteRecording") },
+    { id: "upload", name: t("settingsPage.speechToText.tabs.upload") },
+  ];
+
+  return (
+    <div className="space-y-4">
+      <SectionHeader
+        title={t("settingsPage.speechToText.title")}
+        description={t("settingsPage.speechToText.description")}
+      />
+      <ProviderTabs
+        providers={subTabs}
+        selectedId={tab}
+        onSelect={(id) => setTab(id as SpeechTab)}
+        renderIcon={(id) =>
+          id === "dictation" ? (
+            <Mic className="w-3.5 h-3.5" />
+          ) : id === "upload" ? (
+            <Upload className="w-3.5 h-3.5" />
+          ) : (
+            <FileAudio className="w-3.5 h-3.5" />
+          )
+        }
+      />
+      <TabPanel active={tab === "dictation"}>{renderDictation()}</TabPanel>
+      <TabPanel active={tab === "noteRecording"}>{renderNoteRecording()}</TabPanel>
+      <TabPanel active={tab === "upload"}>{renderUpload()}</TabPanel>
+    </div>
+  );
+}
+
+function LlmsTabs({
+  initialTab,
+  renderDictationCleanup,
+  renderDictationAgent,
+  renderDictationTranslation,
+  renderNoteFormatting,
+  renderChatIntelligence,
+}: {
+  initialTab?: LlmTab;
+  renderDictationCleanup: () => React.ReactNode;
+  renderDictationAgent: () => React.ReactNode;
+  renderDictationTranslation: () => React.ReactNode;
+  renderNoteFormatting: () => React.ReactNode;
+  renderChatIntelligence: () => React.ReactNode;
+}) {
+  const { t } = useTranslation();
+  const agentAllowed = usePolicyStore(isAgentAllowed);
+  const visibleTabIds = agentAllowed
+    ? LLM_TABS
+    : LLM_TABS.filter((tabId) => !AGENT_LLM_TABS.has(tabId));
+  const [tab, setTab] = useSubTab<LlmTab>("settings.llmsTab", visibleTabIds, initialTab);
+
+  const subTabs = [
+    { id: "dictationCleanup", name: t("settingsPage.llms.tabs.dictationCleanup") },
+    { id: "dictationAgent", name: t("settingsPage.llms.tabs.dictationAgent") },
+    { id: "dictationTranslation", name: t("settingsPage.llms.tabs.dictationTranslation") },
+    { id: "noteFormatting", name: t("settingsPage.llms.tabs.noteFormatting") },
+    { id: "chatIntelligence", name: t("settingsPage.llms.tabs.chatIntelligence") },
+  ].filter((item) => visibleTabIds.includes(item.id as LlmTab));
+
+  return (
+    <div className="space-y-4">
+      <SectionHeader
+        title={t("settingsPage.llms.title")}
+        description={t("settingsPage.llms.description")}
+      />
+      <ProviderTabs
+        providers={subTabs}
+        selectedId={tab}
+        onSelect={(id) => setTab(id as LlmTab)}
+        renderIcon={(id) => {
+          if (id === "dictationCleanup") return <Wand2 className="w-3.5 h-3.5" />;
+          if (id === "dictationAgent") return <Sparkles className="w-3.5 h-3.5" />;
+          if (id === "dictationTranslation") return <Languages className="w-3.5 h-3.5" />;
+          if (id === "noteFormatting") return <BookOpen className="w-3.5 h-3.5" />;
+          return <MessageSquare className="w-3.5 h-3.5" />;
+        }}
+      />
+      <TabPanel active={tab === "dictationCleanup"}>{renderDictationCleanup()}</TabPanel>
+      {agentAllowed && (
+        <TabPanel active={tab === "dictationAgent"}>{renderDictationAgent()}</TabPanel>
+      )}
+      <TabPanel active={tab === "dictationTranslation"}>{renderDictationTranslation()}</TabPanel>
+      <TabPanel active={tab === "noteFormatting"}>{renderNoteFormatting()}</TabPanel>
+      {agentAllowed && (
+        <TabPanel active={tab === "chatIntelligence"}>{renderChatIntelligence()}</TabPanel>
+      )}
+    </div>
+  );
+}
+
+function GpuDeviceSelector({ purpose }: { purpose: "transcription" | "intelligence" }) {
+  const { t } = useTranslation();
+  const [gpus, setGpus] = useState<GpuDevice[]>([]);
+  const [selectedUuid, setSelectedUuid] = useState("");
+  const [loaded, setLoaded] = useState(false);
+
+  useEffect(() => {
+    Promise.all([
+      window.electronAPI?.listGpus?.() ?? Promise.resolve([]),
+      window.electronAPI?.getGpuDeviceIndex?.(purpose) ?? Promise.resolve(""),
+    ])
+      .then(([gpuList, savedUuid]) => {
+        setGpus(gpuList);
+        setSelectedUuid(savedUuid || gpuList[0]?.uuid || "");
+        setLoaded(true);
+      })
+      .catch(() => setLoaded(true));
+  }, [purpose]);
+
+  if (!loaded || gpus.length < 2) return null;
+
+  return (
+    <div className="border-t border-border/70 pt-4 mt-4">
+      <SectionHeader
+        title={t(`settingsPage.${purpose}.gpuDevice.title`)}
+        description={t(`settingsPage.${purpose}.gpuDevice.description`)}
+      />
+      <SettingsPanel>
+        <SettingsPanelRow>
+          <div className="relative w-full">
+            <select
+              value={selectedUuid}
+              onChange={async (e) => {
+                const uuid = e.target.value;
+                setSelectedUuid(uuid);
+                await window.electronAPI?.setGpuDeviceIndex?.(purpose, uuid);
+              }}
+              className="w-full appearance-none rounded-md border border-border bg-background px-3 pe-10 py-2 text-sm"
+            >
+              {gpus.map((gpu) => (
+                <option key={gpu.uuid} value={gpu.uuid}>
+                  GPU {gpu.index}: {gpu.name} ({Math.round(gpu.vramMb / 1024)}GB)
+                </option>
+              ))}
+            </select>
+            <svg
+              className="pointer-events-none absolute end-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground"
+              xmlns="http://www.w3.org/2000/svg"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              <path d="m6 9 6 6 6-6" />
+            </svg>
+          </div>
+        </SettingsPanelRow>
+      </SettingsPanel>
+    </div>
+  );
+}
+
+export default function SettingsPage({
+  activeSection = "general",
+  onNavigateToSection,
+  initialSubTab,
+}: SettingsPageProps) {
+  const { isCompact } = useSettingsLayout();
   const {
     confirmDialog,
     alertDialog,
@@ -640,63 +1184,67 @@ export default function SettingsPage({ activeSection = "general" }: SettingsPage
     whisperModel,
     localTranscriptionProvider,
     parakeetModel,
+    cohereModel,
     uiLanguage,
     preferredLanguage,
+    chineseScriptPreference,
     cloudTranscriptionProvider,
     cloudTranscriptionModel,
     cloudTranscriptionBaseUrl,
-    cloudReasoningBaseUrl,
-    useReasoningModel,
-    reasoningModel,
-    reasoningProvider,
-    openaiApiKey,
-    anthropicApiKey,
-    geminiApiKey,
-    groqApiKey,
-    mistralApiKey,
+    useCleanupModel,
     dictationKey,
     activationMode,
     setActivationMode,
-    preferBuiltInMic,
+    microphoneSelectionMode,
     selectedMicDeviceId,
-    setPreferBuiltInMic,
-    setSelectedMicDeviceId,
+    selectedMicDeviceLabel,
+    micWarmHoldSeconds,
+    setMicrophoneSelectionMode,
+    setSelectedMicDevice,
+    setMicWarmHoldSeconds,
     setUseLocalWhisper,
     setUiLanguage,
     setWhisperModel,
     setLocalTranscriptionProvider,
     setParakeetModel,
+    setCohereModel,
     setCloudTranscriptionProvider,
     setCloudTranscriptionModel,
     setCloudTranscriptionBaseUrl,
-    setCloudReasoningBaseUrl,
-    setUseReasoningModel,
-    setReasoningModel,
-    setReasoningProvider,
-    setOpenaiApiKey,
-    setAnthropicApiKey,
-    setGeminiApiKey,
-    setGroqApiKey,
-    setMistralApiKey,
-    customTranscriptionApiKey,
-    setCustomTranscriptionApiKey,
-    customReasoningApiKey,
-    setCustomReasoningApiKey,
+    setUseCleanupModel,
     setDictationKey,
     meetingKey,
     setMeetingKey,
+    meetingHotkeyLayoutMode,
+    setMeetingHotkeyLayoutMode,
     autoLearnCorrections,
     setAutoLearnCorrections,
     updateTranscriptionSettings,
-    updateReasoningSettings,
+    updateCleanupSettings,
     cloudTranscriptionMode,
     setCloudTranscriptionMode,
-    cloudReasoningMode,
-    setCloudReasoningMode,
+    transcriptionMode,
+    setTranscriptionMode,
+    remoteTranscriptionUrl,
+    setRemoteTranscriptionUrl,
+    remoteTranscriptionModel,
+    setRemoteTranscriptionModel,
+    notificationsEnabled,
+    setNotificationsEnabled,
+    notifyMeetingDetection,
+    setNotifyMeetingDetection,
+    notifyCalendarReminders,
+    setNotifyCalendarReminders,
+    autoUpdatesEnabled,
+    setAutoUpdatesEnabled,
     audioCuesEnabled,
     setAudioCuesEnabled,
     pauseMediaOnDictation,
     setPauseMediaOnDictation,
+    showTranscriptionPreview,
+    setShowTranscriptionPreview,
+    autoPasteEnabled,
+    setAutoPasteEnabled,
     keepTranscriptionInClipboard,
     setKeepTranscriptionInClipboard,
     floatingIconAutoHide,
@@ -707,31 +1255,81 @@ export default function SettingsPage({ activeSection = "general" }: SettingsPage
     setPanelStartPosition,
     cloudBackupEnabled,
     setCloudBackupEnabled,
+    insightsSyncEnabled,
     telemetryEnabled,
     setTelemetryEnabled,
     audioRetentionDays,
     setAudioRetentionDays,
+    transcriptRetentionDays,
+    setTranscriptRetentionDays,
     dataRetentionEnabled,
     setDataRetentionEnabled,
     trainingDataEnabled,
     setTrainingDataEnabled,
+    saveDiscardedTranscriptions,
+    setSaveDiscardedTranscriptions,
     customDictionary,
-    setCustomDictionary,
+    noteFilesEnabled,
+    setNoteFilesEnabled,
+    noteFilesPath,
+    setNoteFilesPath,
+    dictationSileroEnabled,
+    setDictationSileroEnabled,
+    noteRecordingSileroEnabled,
+    setNoteRecordingSileroEnabled,
+    meetingSileroEnabled,
+    setMeetingSileroEnabled,
+    whisperVadThreshold,
+    setWhisperVadThreshold,
+    whisperVadMinSpeechDurationMs,
+    setWhisperVadMinSpeechDurationMs,
+    whisperVadMinSilenceDurationMs,
+    setWhisperVadMinSilenceDurationMs,
+    whisperVadMaxSpeechDurationS,
+    setWhisperVadMaxSpeechDurationS,
+    whisperVadSpeechPadMs,
+    setWhisperVadSpeechPadMs,
+    whisperVadSamplesOverlap,
+    setWhisperVadSamplesOverlap,
   } = useSettings();
 
-  const agentKey = useSettingsStore((s) => s.agentKey);
-  const meetingAudioDetection = useSettingsStore((s) => s.meetingAudioDetection);
-  const setMeetingAudioDetection = useSettingsStore((s) => s.setMeetingAudioDetection);
+  const voiceAgentKey = useSettingsStore((s) => s.voiceAgentKey);
+  const setVoiceAgentKey = useSettingsStore((s) => s.setVoiceAgentKey);
+  const translationKey = useSettingsStore((s) => s.translationKey);
+  const setTranslationKey = useSettingsStore((s) => s.setTranslationKey);
+
+  const settingsPolicyState = usePolicySnapshot();
+  const agentAllowedByPolicy = isAgentAllowed(settingsPolicyState);
+  const historyLockedByPolicy = lockedLocalHistoryValue(settingsPolicyState) !== null;
+  const effectiveDataRetentionEnabled = effectiveLocalHistoryEnabled(
+    settingsPolicyState,
+    dataRetentionEnabled
+  );
+  const cloudBackupPolicyAllowed = isCloudBackupAllowed(settingsPolicyState);
+  const audioRetentionCap = maxAudioRetentionDays(settingsPolicyState);
+  const enforcedAudioRetentionDays = effectiveAudioRetentionDays(
+    settingsPolicyState,
+    audioRetentionDays
+  );
 
   const { t, i18n } = useTranslation();
   const { toast } = useToast();
 
   const [currentVersion, setCurrentVersion] = useState<string>("");
   const [isRemovingModels, setIsRemovingModels] = useState(false);
-  const cachePathHint =
+  const [cachePathHint, setCachePathHint] = useState(
     typeof navigator !== "undefined" && /Windows/i.test(navigator.userAgent)
       ? "%USERPROFILE%\\.cache\\openwhispr"
-      : "~/.cache/openwhispr";
+      : "~/.cache/openwhispr"
+  );
+  useEffect(() => {
+    window.electronAPI
+      ?.getModelCacheRoot?.()
+      .then((root) => {
+        if (root) setCachePathHint(root);
+      })
+      .catch(() => {});
+  }, []);
 
   const {
     status: updateStatus,
@@ -744,7 +1342,6 @@ export default function SettingsPage({ activeSection = "general" }: SettingsPage
     downloadUpdate,
     installUpdate: installUpdateAction,
     getAppVersion,
-    error: updateError,
   } = useUpdater();
 
   const isUpdateAvailable =
@@ -752,12 +1349,10 @@ export default function SettingsPage({ activeSection = "general" }: SettingsPage
 
   const migration = useMigration();
 
-  const whisperHook = useWhisper();
+  const { checkWhisperInstallation } = useWhisper();
   const permissionsHook = usePermissions(showAlertDialog);
   const systemAudio = useSystemAudioPermission();
   useClipboard(showAlertDialog);
-  const { agentName, setAgentName } = useAgentName();
-  const [agentNameInput, setAgentNameInput] = useState(agentName);
   const [audioStorageUsage, setAudioStorageUsage] = useState<{
     fileCount: number;
     totalBytes: number;
@@ -773,6 +1368,21 @@ export default function SettingsPage({ activeSection = "general" }: SettingsPage
       .catch(() => {});
   }, [activeSection]);
 
+  // Lazy keep-alive: mount AI sections only after the user has visited them once,
+  // then keep them mounted so model-download progress and IPC listeners survive
+  // section switches. The setState-during-render pattern flips the flag in the
+  // same commit as the section change, so there's no blank frame on first visit.
+  const [hasMountedSpeechToText, setHasMountedSpeechToText] = useState(
+    activeSection === "speechToText"
+  );
+  const [hasMountedLlms, setHasMountedLlms] = useState(activeSection === "llms");
+  if (activeSection === "speechToText" && !hasMountedSpeechToText) {
+    setHasMountedSpeechToText(true);
+  }
+  if (activeSection === "llms" && !hasMountedLlms) {
+    setHasMountedLlms(true);
+  }
+
   const handleClearAllAudio = async () => {
     if (!window.electronAPI?.deleteAllAudio) return;
     try {
@@ -784,21 +1394,23 @@ export default function SettingsPage({ activeSection = "general" }: SettingsPage
     }
   };
 
-  // ydotool status for Wayland paste diagnostics
+  // Wayland paste tool status for diagnostics.
   const [ydotoolStatus, setYdotoolStatus] = useState<{
     isLinux: boolean;
     isWayland: boolean;
     hasYdotool: boolean;
     hasYdotoold: boolean;
+    hasWtype: boolean;
     daemonRunning: boolean;
     hasService: boolean;
     hasUinput: boolean;
     hasUdevRule: boolean;
     hasGroup: boolean;
-    allGood: boolean;
-    isKde?: boolean;
-    hasXclip?: boolean;
-    hasXsel?: boolean;
+    isKde: boolean;
+    isWlroots: boolean;
+    hasXclip: boolean;
+    hasXsel: boolean;
+    isNixOS: boolean;
   } | null>(null);
   const [ydotoolGuideKey, setYdotoolGuideKey] = useState<string | null>(null);
 
@@ -813,40 +1425,36 @@ export default function SettingsPage({ activeSection = "general" }: SettingsPage
     refreshYdotoolStatus();
   }, [refreshYdotoolStatus]);
 
-  const handleSaveAgentName = useCallback(() => {
-    const trimmed = agentNameInput.trim();
-    const previousName = agentName;
-
-    setAgentName(trimmed);
-    setAgentNameInput(trimmed);
-
-    let nextDictionary = customDictionary.filter((w) => w !== previousName);
-    if (trimmed) {
-      const hasName = nextDictionary.some((w) => w.toLowerCase() === trimmed.toLowerCase());
-      if (!hasName) {
-        nextDictionary = [trimmed, ...nextDictionary];
-      }
-    }
-    setCustomDictionary(nextDictionary);
-
-    showAlertDialog({
-      title: t("settingsPage.agentConfig.dialogs.updatedTitle"),
-      description: t("settingsPage.agentConfig.dialogs.updatedDescription", {
-        name: trimmed,
-      }),
-    });
-  }, [
-    agentNameInput,
-    agentName,
-    customDictionary,
-    setAgentName,
-    setCustomDictionary,
-    showAlertDialog,
-    t,
-  ]);
-
   const { theme, setTheme } = useTheme();
   const usage = useUsage();
+  const billingWorkspaces = useWorkspaceStore((s) => s.workspaces);
+  const activeWorkspaceId = useWorkspaceStore((s) => s.activeWorkspaceId);
+  const billingWorkspacesLoaded = useWorkspaceStore((s) => s.loaded);
+  const [enterpriseCheckoutOpen, setEnterpriseCheckoutOpen] = useState(false);
+  const [enterpriseWorkspaceCreateOpen, setEnterpriseWorkspaceCreateOpen] = useState(false);
+  // Until the store resolves, an empty list would make enterpriseTileCta answer
+  // "createWorkspace" for everyone — including members who must never be routed
+  // into creating a workspace. Fall back to contact sales for that window.
+  const enterpriseCta: EnterpriseTileCta = billingWorkspacesLoaded
+    ? enterpriseTileCta(billingWorkspaces, activeWorkspaceId)
+    : { action: "contactSales", ownerName: null };
+  const coveringWorkspaces = billingWorkspaces.filter((workspace) =>
+    usage?.entitledWorkspaceIds?.includes(workspace.id)
+  );
+  const coveringWorkspaceNames = coveringWorkspaces.map((workspace) => workspace.name);
+  // Reads the usage payload, not the workspace store, so the upgrade affordances
+  // stay hidden across the window where the store is still loading.
+  const isWorkspaceCovered =
+    !usage?.isPersonallySubscribed && (usage?.entitledWorkspaceIds?.length ?? 0) > 0;
+  // Null until the store resolves, so the label waits rather than guessing a tier.
+  const coveringPlanLabel =
+    isWorkspaceCovered && coveringWorkspaces.length
+      ? t(
+          `settingsPage.workspace.billing.planLabel.${highestPlan(
+            coveringWorkspaces.map((workspace) => workspace.plan)
+          )}`
+        )
+      : null;
   const hasShownApproachingToast = useRef(false);
   useEffect(() => {
     if (usage?.isApproachingLimit && !hasShownApproachingToast.current) {
@@ -875,7 +1483,10 @@ export default function SettingsPage({ activeSection = "general" }: SettingsPage
 
   const meetingRegisterFn = useCallback(async (hotkey: string) => {
     const result = await window.electronAPI?.registerMeetingHotkey?.(hotkey);
-    return result ?? { success: false, message: "Electron API unavailable" };
+    // No `message`: useHotkeyRegistration falls back to the translated
+    // hooks.hotkeyRegistration.errors.couldNotRegister, and that string is what
+    // gets shown in a toast. An English literal here would surface untranslated.
+    return result ?? { success: false };
   }, []);
 
   const { registerHotkey: registerMeetingHotkey, isRegistering: isMeetingHotkeyRegistering } =
@@ -889,17 +1500,40 @@ export default function SettingsPage({ activeSection = "general" }: SettingsPage
       registerFn: meetingRegisterFn,
     });
 
+  // Agent hotkey setters resolve to false when main-process registration fails;
+  // surface it and return the result so HotkeyListInput rolls the row back.
+  const [isAgentHotkeyCommitting, setIsAgentHotkeyCommitting] = useState(false);
+  const commitAgentHotkey = useCallback(
+    async (setter: (key: string) => Promise<boolean>, key: string) => {
+      setIsAgentHotkeyCommitting(true);
+      try {
+        const ok = await setter(key);
+        if (!ok) {
+          showAlertDialog({
+            title: t("hooks.hotkeyRegistration.titles.notRegistered"),
+            description: t("hooks.hotkeyRegistration.errors.failedToRegister"),
+          });
+        }
+        return ok;
+      } finally {
+        setIsAgentHotkeyCommitting(false);
+      }
+    },
+    [showAlertDialog, t]
+  );
+
   const validateDictationHotkey = useCallback(
     (hotkey: string) =>
       validateHotkeyForSlot(
         hotkey,
         {
           "settingsPage.general.meetingHotkey.title": meetingKey,
-          "agentMode.settings.hotkey": agentKey,
+          "settingsPage.general.voiceAgentHotkey.title": voiceAgentKey,
+          "settingsPage.general.translationHotkey.title": translationKey,
         },
         t
       ),
-    [meetingKey, agentKey, t]
+    [meetingKey, voiceAgentKey, translationKey, t]
   );
 
   const validateMeetingHotkey = useCallback(
@@ -908,54 +1542,136 @@ export default function SettingsPage({ activeSection = "general" }: SettingsPage
         hotkey,
         {
           "settingsPage.general.hotkey.title": dictationKey,
-          "agentMode.settings.hotkey": agentKey,
+          "settingsPage.general.voiceAgentHotkey.title": voiceAgentKey,
+          "settingsPage.general.translationHotkey.title": translationKey,
         },
         t
       ),
-    [dictationKey, agentKey, t]
+    [dictationKey, voiceAgentKey, translationKey, t]
   );
 
-  const [isUsingNativeShortcut, setIsUsingNativeShortcut] = useState(false);
+  const validateVoiceAgentHotkey = useCallback(
+    (hotkey: string) =>
+      validateHotkeyForSlot(
+        hotkey,
+        {
+          "settingsPage.general.hotkey.title": dictationKey,
+          "settingsPage.general.meetingHotkey.title": meetingKey,
+          "settingsPage.general.translationHotkey.title": translationKey,
+        },
+        t
+      ),
+    [dictationKey, meetingKey, translationKey, t]
+  );
+
+  const validateTranslationHotkey = useCallback(
+    (hotkey: string) =>
+      validateHotkeyForSlot(
+        hotkey,
+        {
+          "settingsPage.general.hotkey.title": dictationKey,
+          "settingsPage.general.meetingHotkey.title": meetingKey,
+          "settingsPage.general.voiceAgentHotkey.title": voiceAgentKey,
+        },
+        t
+      ),
+    [dictationKey, meetingKey, voiceAgentKey, t]
+  );
+
+  const {
+    isUsingNativeShortcut,
+    isUsingHyprland,
+    hyprlandConfigStatus,
+    supportsPushToTalk,
+    pushToTalkUnavailableReason,
+  } = useHotkeyModeInfo("settings", dictationKey);
+  const [effectiveDefaultHotkey, setEffectiveDefaultHotkey] = useState<string | null>(null);
+  const [linuxPttAvailable, setLinuxPttAvailable] = useState(true);
 
   const platform = getCachedPlatform();
 
   const [autoStartEnabled, setAutoStartEnabled] = useState(false);
+  const [autoStartNeedsApproval, setAutoStartNeedsApproval] = useState(false);
   const [autoStartLoading, setAutoStartLoading] = useState(true);
 
-  useEffect(() => {
-    if (platform === "linux") {
-      setAutoStartLoading(false);
-      return;
+  const readAutoStartState = useCallback(async () => {
+    if (!window.electronAPI?.getAutoStartEnabled) return;
+    try {
+      const state = await window.electronAPI.getAutoStartEnabled();
+      setAutoStartEnabled(state.enabled);
+      setAutoStartNeedsApproval(state.requiresApproval);
+    } catch (error) {
+      logger.error("Failed to get auto-start status", error, "settings");
     }
-    const loadAutoStart = async () => {
-      if (window.electronAPI?.getAutoStartEnabled) {
-        try {
-          const enabled = await window.electronAPI.getAutoStartEnabled();
-          setAutoStartEnabled(enabled);
-        } catch (error) {
-          logger.error("Failed to get auto-start status", error, "settings");
-        }
-      }
-      setAutoStartLoading(false);
-    };
-    loadAutoStart();
-  }, [platform]);
+  }, []);
+
+  useEffect(() => {
+    readAutoStartState().finally(() => setAutoStartLoading(false));
+  }, [readAutoStartState]);
+
+  useEffect(() => {
+    window.electronAPI?.syncNotificationPreferences?.({
+      notificationsEnabled,
+      notifyMeetingDetection,
+      notifyCalendarReminders,
+    });
+  }, [notificationsEnabled, notifyMeetingDetection, notifyCalendarReminders]);
 
   const handleAutoStartChange = async (enabled: boolean) => {
-    if (window.electronAPI?.setAutoStartEnabled) {
-      try {
-        setAutoStartLoading(true);
-        const result = await window.electronAPI.setAutoStartEnabled(enabled);
-        if (result.success) {
-          setAutoStartEnabled(enabled);
-        }
-      } catch (error) {
-        logger.error("Failed to set auto-start", error, "settings");
-      } finally {
-        setAutoStartLoading(false);
-      }
+    if (!window.electronAPI?.setAutoStartEnabled) return;
+    try {
+      setAutoStartLoading(true);
+      const result = await window.electronAPI.setAutoStartEnabled(enabled);
+      // Read the state back rather than assuming: on Windows the OS can have the
+      // item disabled out from under us, and on macOS it can need approval first.
+      if (result.success) await readAutoStartState();
+    } catch (error) {
+      logger.error("Failed to set auto-start", error, "settings");
+    } finally {
+      setAutoStartLoading(false);
     }
   };
+
+  const [noteFilesDefaultPath, setNoteFilesDefaultPath] = useState("");
+  const [noteFilesRebuilding, setNoteFilesRebuilding] = useState(false);
+
+  useEffect(() => {
+    if (!noteFilesEnabled) return;
+    window.electronAPI?.noteFilesGetDefaultPath?.().then((p) => {
+      if (p) setNoteFilesDefaultPath(p);
+    });
+  }, [noteFilesEnabled]);
+
+  const handleNoteFilesToggle = useCallback(
+    async (enabled: boolean) => {
+      setNoteFilesEnabled(enabled);
+      await window.electronAPI?.noteFilesSetEnabled?.(enabled, noteFilesPath || undefined);
+    },
+    [setNoteFilesEnabled, noteFilesPath]
+  );
+
+  const handleNoteFilesChangePath = useCallback(async () => {
+    const result = await window.electronAPI?.noteFilesPickFolder?.();
+    if (result?.canceled || !result?.path) return;
+    setNoteFilesPath(result.path);
+    await window.electronAPI?.noteFilesSetPath?.(result.path);
+  }, [setNoteFilesPath]);
+
+  const handleNoteFilesRebuild = useCallback(async () => {
+    setNoteFilesRebuilding(true);
+    try {
+      const result = await window.electronAPI?.noteFilesRebuild?.();
+      if (result && !result.success) {
+        toast({
+          title: t("settings.noteFiles.rebuildError.title"),
+          description: result.error || t("settings.noteFiles.rebuildError.description"),
+          variant: "destructive",
+        });
+      }
+    } finally {
+      setNoteFilesRebuilding(false);
+    }
+  }, [toast, t]);
 
   useEffect(() => {
     let mounted = true;
@@ -967,7 +1683,7 @@ export default function SettingsPage({ activeSection = "general" }: SettingsPage
       if (version && mounted) setCurrentVersion(version);
 
       if (mounted) {
-        whisperHook.checkWhisperInstallation();
+        checkWhisperInstallation();
       }
     }, 100);
 
@@ -975,31 +1691,33 @@ export default function SettingsPage({ activeSection = "general" }: SettingsPage
       mounted = false;
       clearTimeout(timer);
     };
-  }, [whisperHook.checkWhisperInstallation, getAppVersion]);
+  }, [checkWhisperInstallation, getAppVersion]);
 
   useEffect(() => {
-    const checkHotkeyMode = async () => {
+    const loadEffectiveDefaultHotkey = async () => {
       try {
-        const info = await window.electronAPI?.getHotkeyModeInfo();
-        if (info?.isUsingNativeShortcut) {
-          setIsUsingNativeShortcut(true);
-          setActivationMode("tap");
-        }
+        const key = await window.electronAPI?.getEffectiveDefaultHotkey?.();
+        if (key) setEffectiveDefaultHotkey(key);
       } catch (error) {
-        logger.error("Failed to check hotkey mode", error, "settings");
+        logger.error("Failed to get effective default hotkey", error, "settings");
       }
     };
-    checkHotkeyMode();
-  }, [setActivationMode]);
+    loadEffectiveDefaultHotkey();
+  }, []);
 
   useEffect(() => {
-    if (updateError) {
-      showAlertDialog({
-        title: t("settingsPage.general.updates.dialogs.updateError.title"),
-        description: t("settingsPage.general.updates.dialogs.updateError.description"),
+    const cleanup = window.electronAPI?.onLinuxPttPermissionDenied?.(() => {
+      setLinuxPttAvailable(false);
+      toast({
+        title: t("settingsPage.general.hotkey.linuxPttPermissionTitle"),
+        description: t("settingsPage.general.hotkey.linuxPttPermissionDescription"),
+        variant: "destructive",
+        duration: 15000,
       });
-    }
-  }, [updateError, showAlertDialog, t]);
+      setActivationMode("tap");
+    });
+    return () => cleanup?.();
+  }, [toast, t, setActivationMode]);
 
   useEffect(() => {
     if (installInitiated) {
@@ -1065,6 +1783,8 @@ export default function SettingsPage({ activeSection = "general" }: SettingsPage
               description: t("settingsPage.developer.removeModels.failedDescription"),
             });
           } else {
+            // Every local model is gone, so no local selection can still resolve.
+            clearMissingLocalModelSelections(() => false);
             window.dispatchEvent(new Event("openwhispr-models-cleared"));
             showAlertDialog({
               title: t("settingsPage.developer.removeModels.successTitle"),
@@ -1083,14 +1803,87 @@ export default function SettingsPage({ activeSection = "general" }: SettingsPage
     });
   }, [isRemovingModels, cachePathHint, showConfirmDialog, showAlertDialog, t]);
 
-  const { isSignedIn, isLoaded, user } = useAuth();
+  const { isSignedIn, isLoaded, user, refetch } = useAuth();
+  const {
+    canToggleSync: canToggleInsightsSync,
+    disableInsightsSync,
+    enableInsightsSync,
+    optInDialog: insightsOptInDialog,
+    syncAllowedByPolicy: insightsSyncAllowedByPolicy,
+  } = useInsightsSyncOptIn();
+  const {
+    enabled: leaderboardParticipationEnabled,
+    error: leaderboardParticipationError,
+    join: joinLeaderboard,
+    leave: leaveLeaderboard,
+    leavePending: leaderboardLeavePending,
+    ready: leaderboardParticipationReady,
+    updating: leaderboardParticipationUpdating,
+  } = useLeaderboardParticipation();
+  const [leaderboardPreferencePending, setLeaderboardPreferencePending] = useState(false);
+  const updateLeaderboardParticipation = useCallback(
+    async (enabled: boolean) => {
+      if (!isSignedIn || !leaderboardParticipationReady || leaderboardPreferencePending) return;
+      setLeaderboardPreferencePending(true);
+      try {
+        if (enabled) {
+          if (
+            !effectiveDataRetentionEnabled ||
+            !insightsSyncAllowedByPolicy ||
+            (!insightsSyncEnabled && !(await enableInsightsSync({ confirmWhenEmpty: true })))
+          )
+            return;
+          if (!(await joinLeaderboard())) {
+            toast({
+              title: t("insights.leaderboard.activationError"),
+              variant: "destructive",
+            });
+          }
+          return;
+        }
+
+        if (!(await leaveLeaderboard())) {
+          toast({ title: t("insights.leaderboard.leavePending") });
+        }
+      } finally {
+        setLeaderboardPreferencePending(false);
+      }
+    },
+    [
+      effectiveDataRetentionEnabled,
+      enableInsightsSync,
+      insightsSyncAllowedByPolicy,
+      insightsSyncEnabled,
+      isSignedIn,
+      joinLeaderboard,
+      leaderboardParticipationReady,
+      leaderboardPreferencePending,
+      leaveLeaderboard,
+      t,
+      toast,
+    ]
+  );
+  // Signed out there is nothing to load and the plan grid is purely
+  // promotional; signed in, no card may claim a plan until usage confirms one.
+  const planStateKnown = !isSignedIn || usage?.status === "success";
+  const proCardCta = decideProPlanCardCta({
+    isSignedIn,
+    planStateKnown,
+    isPersonallySubscribed: usage?.isPersonallySubscribed ?? false,
+    plan: usage?.plan ?? "free",
+    isTrial: usage?.isTrial ?? false,
+    isWorkspaceCovered,
+  });
   const [isSigningOut, setIsSigningOut] = useState(false);
   const [isDeletingAccount, setIsDeletingAccount] = useState(false);
-  const [isOpeningBilling, setIsOpeningBilling] = useState(false);
+  const [isDeleteAccountDialogOpen, setIsDeleteAccountDialogOpen] = useState(false);
+  const [eraseDeviceData, setEraseDeviceData] = useState(false);
+  const { openBillingPortal, isOpening: isOpeningBilling } = useBillingPortal(usage);
   const [billingState, setBillingState] = useState<Record<string, boolean>>({
     pro: true,
     business: true,
   });
+  const [checkoutTier, setCheckoutTier] = useState<string | null>(null);
   const [switchPreview, setSwitchPreview] = useState<{
     plan: "monthly" | "annual";
     tier: "pro" | "business";
@@ -1102,22 +1895,7 @@ export default function SettingsPage({ activeSection = "general" }: SettingsPage
   } | null>(null);
   const [previewLoading, setPreviewLoading] = useState(false);
 
-  const startOnboarding = useCallback(() => {
-    localStorage.setItem("pendingCloudMigration", "true");
-    localStorage.setItem("onboardingCurrentStep", "0");
-    localStorage.removeItem("onboardingCompleted");
-    window.location.reload();
-  }, []);
-
-  const handleBillingPortal = useCallback(async () => {
-    const result = await usage.openBillingPortal();
-    if (!result.success) {
-      toast({
-        title: t("settingsPage.account.checkout.couldNotOpenTitle"),
-        description: t("settingsPage.account.checkout.couldNotOpenDescription"),
-      });
-    }
-  }, [usage, toast, t]);
+  const startOnboarding = useStartOnboarding();
 
   const handleSwitchPlan = useCallback(
     async (plan: "monthly" | "annual", tier: "pro" | "business") => {
@@ -1169,7 +1947,9 @@ export default function SettingsPage({ activeSection = "general" }: SettingsPage
 
   const handleCheckout = useCallback(
     async (plan: "monthly" | "annual", tier: "pro" | "business") => {
+      setCheckoutTier(tier);
       const result = await usage.openCheckout({ plan, tier });
+      setCheckoutTier(null);
       if (!result.success) {
         toast({
           title: t("settingsPage.account.checkout.couldNotOpenTitle"),
@@ -1183,6 +1963,9 @@ export default function SettingsPage({ activeSection = "general" }: SettingsPage
   const handleSignOut = useCallback(async () => {
     setIsSigningOut(true);
     try {
+      // Clear account-scoped renderer/session state before ending the session.
+      // Workspace-owned rows remain cached behind their membership boundary.
+      await syncService.purgeTeamSpacesForSignOut();
       await signOut();
       window.location.reload();
     } catch (error) {
@@ -1197,54 +1980,201 @@ export default function SettingsPage({ activeSection = "general" }: SettingsPage
   }, [showAlertDialog, t]);
 
   const handleDeleteAccount = useCallback(() => {
-    showConfirmDialog({
-      title: t("settingsPage.account.deleteAccount.title"),
-      description: t("settingsPage.account.deleteAccount.description"),
-      onConfirm: async () => {
-        setIsDeletingAccount(true);
-        try {
-          // Best-effort cloud cleanup (needs session cookies before sign-out)
-          try {
-            const { NotesService } = await import("../services/NotesService");
-            await NotesService.deleteAll();
-          } catch {}
+    setEraseDeviceData(false);
+    setIsDeleteAccountDialogOpen(true);
+  }, []);
 
-          const result = await deleteAccount();
-          if (result.error) {
-            logger.error("Server account deletion failed", result.error, "auth");
-          }
+  const confirmDeleteAccount = useCallback(async () => {
+    const accountId = user?.id;
+    const authGeneration = getValidatedAuthGeneration();
+    if (!accountId || authGeneration == null) {
+      showAlertDialog({
+        title: t("settingsPage.account.deleteAccount.failedTitle"),
+        description: t("settingsPage.account.deleteAccount.failedDescription"),
+      });
+      return;
+    }
 
-          try {
-            await signOut();
-          } catch {}
-          await window.electronAPI?.cleanupApp();
+    setIsDeletingAccount(true);
+    try {
+      const result = await executeAccountDeletion({
+        eraseDeviceData,
+        dependencies: {
+          deleteRemoteAccount: deleteAccount,
+          deleteLocalAccountData: async () => {
+            const cleanup = await window.electronAPI?.deleteAccountData?.(
+              accountId,
+              authGeneration
+            );
+            if (!cleanup?.success) {
+              throw new Error(cleanup?.error ?? "Could not remove local account data");
+            }
+          },
+          clearWorkspaceSessionState: () => syncService.purgeTeamSpacesForSignOut(),
+          signOut,
+          eraseDeviceData: async () => {
+            const cleanup = await window.electronAPI?.cleanupApp();
+            if (!cleanup?.success) {
+              throw new Error(cleanup?.errors?.join(", ") || "Could not erase device data");
+            }
+          },
+        },
+      });
 
-          showAlertDialog({
-            title: t("settingsPage.account.deleteAccount.successTitle"),
-            description: t("settingsPage.account.deleteAccount.successDescription"),
-          });
-          setTimeout(() => window.location.reload(), 1000);
-        } catch (error) {
-          logger.error("Account deletion failed", error, "auth");
-          showAlertDialog({
-            title: t("settingsPage.account.deleteAccount.failedTitle"),
-            description: t("settingsPage.account.deleteAccount.failedDescription"),
-          });
-        } finally {
-          setIsDeletingAccount(false);
-        }
-      },
-      variant: "destructive",
-      confirmText: t("settingsPage.account.deleteAccount.confirmText"),
-    });
-  }, [showConfirmDialog, showAlertDialog, t]);
+      showAlertDialog({
+        title: t("settingsPage.account.deleteAccount.successTitle"),
+        description:
+          result.localCleanupFailures.length > 0
+            ? t("settingsPage.account.deleteAccount.partialCleanupDescription")
+            : t("settingsPage.account.deleteAccount.successDescription"),
+      });
+      setTimeout(() => window.location.reload(), 1000);
+    } catch (error) {
+      logger.error("Account deletion failed", error, "auth");
+      showAlertDialog({
+        title: t("settingsPage.account.deleteAccount.failedTitle"),
+        description: t("settingsPage.account.deleteAccount.failedDescription"),
+      });
+    } finally {
+      setIsDeletingAccount(false);
+    }
+  }, [eraseDeviceData, showAlertDialog, t, user?.id]);
+
+  const renderWhisperVadSettings = () => (
+    <div>
+      <SectionHeader
+        title={t("settingsPage.transcription.vad.title")}
+        description={t("settingsPage.transcription.vad.description")}
+      />
+      <SettingsPanel>
+        <SettingsPanelRow>
+          <SettingsRow
+            label={t("settingsPage.transcription.vad.toggles.dictation.title")}
+            description={t("settingsPage.transcription.vad.toggles.dictation.description")}
+          >
+            <Toggle checked={dictationSileroEnabled} onChange={setDictationSileroEnabled} />
+          </SettingsRow>
+        </SettingsPanelRow>
+        <SettingsPanelRow>
+          <SettingsRow
+            label={t("settingsPage.transcription.vad.toggles.noteRecording.title")}
+            description={t("settingsPage.transcription.vad.toggles.noteRecording.description")}
+          >
+            <Toggle checked={noteRecordingSileroEnabled} onChange={setNoteRecordingSileroEnabled} />
+          </SettingsRow>
+        </SettingsPanelRow>
+        <SettingsPanelRow>
+          <SettingsRow
+            label={t("settingsPage.transcription.vad.toggles.meeting.title")}
+            description={t("settingsPage.transcription.vad.toggles.meeting.description")}
+          >
+            <Toggle checked={meetingSileroEnabled} onChange={setMeetingSileroEnabled} />
+          </SettingsRow>
+        </SettingsPanelRow>
+        <SettingsPanelRow>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 w-full">
+            <div className="space-y-1.5">
+              <VADLabelWithInfo
+                label={t("settingsPage.transcription.vad.fields.threshold.label")}
+                description={t("settingsPage.transcription.vad.fields.threshold.info")}
+              />
+              <Input
+                dir="ltr"
+                type="number"
+                step="0.01"
+                min="0.1"
+                max="0.95"
+                value={whisperVadThreshold}
+                onChange={(e) => setWhisperVadThreshold(Number(e.target.value))}
+              />
+            </div>
+            <div className="space-y-1.5">
+              <VADLabelWithInfo
+                label={t("settingsPage.transcription.vad.fields.minSpeechDurationMs.label")}
+                description={t("settingsPage.transcription.vad.fields.minSpeechDurationMs.info")}
+              />
+              <Input
+                dir="ltr"
+                type="number"
+                step="10"
+                min="50"
+                max="2000"
+                value={whisperVadMinSpeechDurationMs}
+                onChange={(e) => setWhisperVadMinSpeechDurationMs(Number(e.target.value))}
+              />
+            </div>
+            <div className="space-y-1.5">
+              <VADLabelWithInfo
+                label={t("settingsPage.transcription.vad.fields.minSilenceDurationMs.label")}
+                description={t("settingsPage.transcription.vad.fields.minSilenceDurationMs.info")}
+              />
+              <Input
+                dir="ltr"
+                type="number"
+                step="10"
+                min="50"
+                max="2000"
+                value={whisperVadMinSilenceDurationMs}
+                onChange={(e) => setWhisperVadMinSilenceDurationMs(Number(e.target.value))}
+              />
+            </div>
+            <div className="space-y-1.5">
+              <VADLabelWithInfo
+                label={t("settingsPage.transcription.vad.fields.maxSpeechDurationS.label")}
+                description={t("settingsPage.transcription.vad.fields.maxSpeechDurationS.info")}
+              />
+              <Input
+                dir="ltr"
+                type="number"
+                step="1"
+                min="5"
+                max="120"
+                value={whisperVadMaxSpeechDurationS}
+                onChange={(e) => setWhisperVadMaxSpeechDurationS(Number(e.target.value))}
+              />
+            </div>
+            <div className="space-y-1.5">
+              <VADLabelWithInfo
+                label={t("settingsPage.transcription.vad.fields.speechPadMs.label")}
+                description={t("settingsPage.transcription.vad.fields.speechPadMs.info")}
+              />
+              <Input
+                dir="ltr"
+                type="number"
+                step="10"
+                min="0"
+                max="1000"
+                value={whisperVadSpeechPadMs}
+                onChange={(e) => setWhisperVadSpeechPadMs(Number(e.target.value))}
+              />
+            </div>
+            <div className="space-y-1.5">
+              <VADLabelWithInfo
+                label={t("settingsPage.transcription.vad.fields.samplesOverlap.label")}
+                description={t("settingsPage.transcription.vad.fields.samplesOverlap.info")}
+              />
+              <Input
+                dir="ltr"
+                type="number"
+                step="0.01"
+                min="0"
+                max="0.95"
+                value={whisperVadSamplesOverlap}
+                onChange={(e) => setWhisperVadSamplesOverlap(Number(e.target.value))}
+              />
+            </div>
+          </div>
+        </SettingsPanelRow>
+      </SettingsPanel>
+    </div>
+  );
 
   const renderSectionContent = () => {
     switch (activeSection) {
       case "account":
         return (
           <div className="space-y-5">
-            {!NEON_AUTH_URL ? (
+            {!AUTH_URL ? (
               <>
                 <SectionHeader
                   title={t("settingsPage.account.title")}
@@ -1264,30 +2194,12 @@ export default function SettingsPage({ activeSection = "general" }: SettingsPage
             ) : isLoaded && isSignedIn && user ? (
               <>
                 <SectionHeader title={t("settingsPage.account.title")} />
-                <SettingsPanel>
-                  <SettingsPanelRow>
-                    <div className="flex items-center gap-3">
-                      <div className="w-10 h-10 rounded-full flex items-center justify-center shrink-0 overflow-hidden bg-primary/10 dark:bg-primary/15">
-                        {user.image ? (
-                          <img
-                            src={user.image}
-                            alt={user.name || t("settingsPage.account.user")}
-                            className="w-10 h-10 rounded-full object-cover"
-                          />
-                        ) : (
-                          <UserCircle className="w-5 h-5 text-primary" />
-                        )}
-                      </div>
-                      <div className="min-w-0 flex-1">
-                        <p className="text-xs font-medium text-foreground truncate">
-                          {user.name || t("settingsPage.account.user")}
-                        </p>
-                        <p className="text-xs text-muted-foreground truncate">{user.email}</p>
-                      </div>
-                      <Badge variant="success">{t("settingsPage.account.signedIn")}</Badge>
-                    </div>
-                  </SettingsPanelRow>
-                </SettingsPanel>
+                <ProfileSection
+                  name={user.name || ""}
+                  onSessionRefresh={() => {
+                    void refetch();
+                  }}
+                />
 
                 <SettingsPanel>
                   <SettingsPanelRow>
@@ -1298,7 +2210,7 @@ export default function SettingsPage({ activeSection = "general" }: SettingsPage
                       size="sm"
                       className="w-full text-destructive border-destructive/30 hover:bg-destructive/10 hover:border-destructive/50"
                     >
-                      <LogOut className="mr-1.5 h-3.5 w-3.5" />
+                      <LogOut className="me-1.5 h-3.5 w-3.5" />
                       {isSigningOut
                         ? t("settingsPage.account.signOut.signingOut")
                         : t("settingsPage.account.signOut.signOut")}
@@ -1319,7 +2231,7 @@ export default function SettingsPage({ activeSection = "general" }: SettingsPage
                         size="sm"
                         className="text-destructive border-destructive/30 hover:bg-destructive/10 hover:border-destructive"
                       >
-                        <Trash2 className="mr-1.5 h-3.5 w-3.5" />
+                        <Trash2 className="me-1.5 h-3.5 w-3.5" />
                         {isDeletingAccount
                           ? t("settingsPage.account.deleteAccount.deleting")
                           : t("settingsPage.account.deleteAccount.button")}
@@ -1357,7 +2269,7 @@ export default function SettingsPage({ activeSection = "general" }: SettingsPage
                         </p>
                       </div>
                       <Button onClick={startOnboarding} size="sm" className="w-full">
-                        <UserCircle className="mr-1.5 h-3.5 w-3.5" />
+                        <UserCircle className="me-1.5 h-3.5 w-3.5" />
                         {t("settingsPage.account.trialCta.button")}
                       </Button>
                     </div>
@@ -1383,7 +2295,7 @@ export default function SettingsPage({ activeSection = "general" }: SettingsPage
       case "plansBilling":
         return (
           <div className="space-y-5">
-            {!NEON_AUTH_URL ? (
+            {!AUTH_URL ? (
               <>
                 <SectionHeader
                   title={t("settingsPage.account.pricing.title")}
@@ -1402,401 +2314,33 @@ export default function SettingsPage({ activeSection = "general" }: SettingsPage
               </>
             ) : isLoaded ? (
               <>
-                <SectionHeader title={t("settingsPage.account.pricing.title")} />
-                <div className="grid grid-cols-4 gap-1.5">
-                  {/* Free */}
-                  <div
-                    className={cn(
-                      "rounded-md p-2.5 flex flex-col",
-                      !usage?.isSubscribed && !usage?.isTrial
-                        ? "border-2 border-primary/30 bg-primary/3 dark:border-primary/20 dark:bg-primary/5"
-                        : "border border-border/50 dark:border-border-subtle/60 bg-card/30 dark:bg-surface-2/30"
-                    )}
-                  >
-                    <p className="text-xs font-semibold text-foreground">
-                      {t("settingsPage.account.pricing.free.name")}
-                    </p>
-                    <div className="flex items-baseline gap-0.5 mt-0.5">
-                      <span className="text-lg font-bold text-foreground">
-                        {t("settingsPage.account.pricing.free.price")}
-                      </span>
-                      <span className="text-[9px] text-muted-foreground">
-                        / {t("settingsPage.account.pricing.free.period")}
-                      </span>
-                    </div>
-                    <ul className="space-y-0.5 mt-2 flex-1">
-                      {(
-                        t("settingsPage.account.pricing.free.features", {
-                          returnObjects: true,
-                        }) as string[]
-                      ).map((feature, i) =>
-                        feature.startsWith("## ") ? (
-                          <li
-                            key={i}
-                            className={`text-[8px] font-semibold uppercase tracking-wide text-muted-foreground/60 ${i > 0 ? "pt-1.5" : ""}`}
-                          >
-                            {feature.slice(3)}
-                          </li>
-                        ) : (
-                          <li
-                            key={i}
-                            className="flex items-start gap-1 text-[10px] text-muted-foreground leading-tight"
-                          >
-                            <Check size={9} className="mt-[2px] text-primary/70 shrink-0" />
-                            {feature}
-                          </li>
-                        )
-                      )}
-                    </ul>
-                    {!isSignedIn ? (
-                      <Button
-                        onClick={startOnboarding}
-                        variant="outline"
-                        size="sm"
-                        className="mt-2 w-full h-6 text-[10px]"
-                      >
-                        {t("settingsPage.account.signedOutPlans.button")}
-                      </Button>
-                    ) : usage?.isSubscribed && !usage?.isTrial ? (
-                      <Button
-                        onClick={handleBillingPortal}
-                        variant="outline"
-                        size="sm"
-                        className="mt-2 w-full h-6 text-[10px]"
-                      >
-                        {t("settingsPage.account.pricing.downgrade")}
-                      </Button>
-                    ) : (
-                      <div className="mt-2 text-center">
-                        <span className="text-[9px] font-medium text-primary/70">
-                          {t("settingsPage.account.pricing.currentPlan")}
-                        </span>
-                      </div>
-                    )}
-                  </div>
-
-                  {/* Pro */}
-                  <div
-                    className={cn(
-                      "rounded-md border-2 p-2.5 flex flex-col",
-                      usage?.isSubscribed && usage?.plan === "pro"
-                        ? "border-primary/40 bg-primary/5 dark:border-primary/30 dark:bg-primary/8"
-                        : "border-primary/20 bg-primary/2 dark:border-primary/15 dark:bg-primary/3"
-                    )}
-                  >
-                    <p className="text-xs font-semibold text-foreground">
-                      {t("settingsPage.account.pricing.pro.name")}
-                    </p>
-                    <button
-                      onClick={() => setBillingState((prev) => ({ ...prev, pro: !prev.pro }))}
-                      role="switch"
-                      aria-checked={billingState.pro}
-                      className="flex items-center gap-1.5 mt-1"
-                    >
-                      <div
-                        className={`relative w-7 h-4 rounded-full transition-colors ${billingState.pro ? "bg-primary" : "bg-muted"}`}
-                      >
-                        <div
-                          className={`absolute top-0.5 left-0.5 w-3 h-3 rounded-full bg-white transition-transform ${billingState.pro ? "translate-x-3" : ""}`}
-                        />
-                      </div>
-                      <span className="text-[9px] text-muted-foreground">
-                        {t("settingsPage.account.pricing.billedYearly")}
-                      </span>
-                    </button>
-                    <div className="flex items-baseline gap-0.5 mt-1">
-                      <span className="text-lg font-bold text-foreground">
-                        {billingState.pro
-                          ? t("settingsPage.account.pricing.pro.annualEquivalent")
-                          : t("settingsPage.account.pricing.pro.monthlyPrice")}
-                      </span>
-                      <span className="text-[9px] text-muted-foreground">
-                        {t("settingsPage.account.pricing.pro.monthlyPeriod")}
-                      </span>
-                    </div>
-                    <p className="text-[9px] text-muted-foreground/70 mt-1.5">
-                      {t("settingsPage.account.pricing.pro.includesPrefix")}
-                    </p>
-                    <ul className="space-y-0.5 mt-1 flex-1">
-                      {(
-                        t("settingsPage.account.pricing.pro.features", {
-                          returnObjects: true,
-                        }) as string[]
-                      ).map((feature, i) => (
-                        <li
-                          key={i}
-                          className="flex items-start gap-1 text-[10px] text-muted-foreground leading-tight"
-                        >
-                          <Check size={9} className="mt-[2px] text-primary shrink-0" />
-                          {feature}
-                        </li>
-                      ))}
-                    </ul>
-                    {(usage?.isSubscribed && usage?.plan === "pro" && !usage?.isTrial) ||
-                    usage?.isTrial ? (
-                      <div className="mt-2 text-center">
-                        <span className="text-[9px] font-medium text-primary">
-                          {t("settingsPage.account.pricing.currentPlan")}
-                        </span>
-                      </div>
-                    ) : usage?.isSubscribed && usage?.plan === "business" ? (
-                      <Button
-                        onClick={() =>
-                          handleSwitchPlan(billingState.pro ? "annual" : "monthly", "pro")
-                        }
-                        disabled={previewLoading || usage.checkoutLoading}
-                        variant="outline"
-                        size="sm"
-                        className="mt-2 w-full h-6 text-[10px]"
-                      >
-                        {previewLoading ? (
-                          <Loader2 size={10} className="animate-spin" />
-                        ) : (
-                          t("settingsPage.account.pricing.downgrade")
-                        )}
-                      </Button>
-                    ) : (
-                      <Button
-                        onClick={() =>
-                          handleCheckout(billingState.pro ? "annual" : "monthly", "pro")
-                        }
-                        disabled={usage?.checkoutLoading}
-                        size="sm"
-                        className="mt-2 w-full h-6 text-[10px]"
-                      >
-                        {t("settingsPage.account.pricing.pro.cta")}
-                      </Button>
-                    )}
-                  </div>
-
-                  {/* Business */}
-                  <div className="rounded-md border-2 border-primary/50 bg-primary/8 dark:border-primary/40 dark:bg-primary/10 p-2.5 flex flex-col relative">
-                    <span className="absolute -top-2.5 left-1/2 -translate-x-1/2 bg-primary text-primary-foreground text-[8px] font-semibold px-2.5 py-0.5 rounded-full whitespace-nowrap shadow-sm">
-                      {t("settingsPage.account.pricing.business.badge")}
-                    </span>
-                    <p className="text-xs font-semibold text-foreground">
-                      {t("settingsPage.account.pricing.business.name")}
-                    </p>
-                    <button
-                      onClick={() =>
-                        setBillingState((prev) => ({ ...prev, business: !prev.business }))
-                      }
-                      role="switch"
-                      aria-checked={billingState.business}
-                      className="flex items-center gap-1.5 mt-1"
-                    >
-                      <div
-                        className={`relative w-7 h-4 rounded-full transition-colors ${billingState.business ? "bg-primary" : "bg-muted"}`}
-                      >
-                        <div
-                          className={`absolute top-0.5 left-0.5 w-3 h-3 rounded-full bg-white transition-transform ${billingState.business ? "translate-x-3" : ""}`}
-                        />
-                      </div>
-                      <span className="text-[9px] text-muted-foreground">
-                        {t("settingsPage.account.pricing.billedYearly")}
-                      </span>
-                    </button>
-                    <div className="flex items-baseline gap-0.5 mt-1">
-                      <span className="text-lg font-bold text-foreground">
-                        {billingState.business
-                          ? t("settingsPage.account.pricing.business.annualEquivalent")
-                          : t("settingsPage.account.pricing.business.monthlyPrice")}
-                      </span>
-                      <span className="text-[9px] text-muted-foreground">
-                        {t("settingsPage.account.pricing.business.monthlyPeriod")}
-                      </span>
-                    </div>
-                    <p className="text-[9px] text-muted-foreground/70 mt-1.5">
-                      {t("settingsPage.account.pricing.business.includesPrefix")}
-                    </p>
-                    <ul className="space-y-0.5 mt-1 flex-1">
-                      {(
-                        t("settingsPage.account.pricing.business.features", {
-                          returnObjects: true,
-                        }) as string[]
-                      ).map((feature, i) => (
-                        <li
-                          key={i}
-                          className="flex items-start gap-1 text-[10px] text-muted-foreground leading-tight"
-                        >
-                          <Check size={9} className="mt-[2px] text-primary shrink-0" />
-                          {feature}
-                        </li>
-                      ))}
-                    </ul>
-                    {usage?.isSubscribed && usage?.plan === "business" && !usage?.isTrial ? (
-                      <div className="mt-2 text-center">
-                        <span className="text-[9px] font-medium text-primary">
-                          {t("settingsPage.account.pricing.currentPlan")}
-                        </span>
-                      </div>
-                    ) : usage?.isSubscribed && usage?.plan === "pro" && !usage?.isTrial ? (
-                      <Button
-                        onClick={() =>
-                          handleSwitchPlan(billingState.business ? "annual" : "monthly", "business")
-                        }
-                        disabled={previewLoading || usage.checkoutLoading}
-                        size="sm"
-                        className="mt-2 w-full h-6 text-[10px]"
-                      >
-                        {previewLoading ? (
-                          <Loader2 size={10} className="animate-spin" />
-                        ) : (
-                          t("settingsPage.account.pricing.upgrade")
-                        )}
-                      </Button>
-                    ) : (
-                      <Button
-                        onClick={() =>
-                          handleCheckout(billingState.business ? "annual" : "monthly", "business")
-                        }
-                        disabled={usage?.checkoutLoading}
-                        size="sm"
-                        className="mt-2 w-full h-6 text-[10px]"
-                      >
-                        {t("settingsPage.account.pricing.business.cta")}
-                      </Button>
-                    )}
-                  </div>
-
-                  {/* Enterprise */}
-                  <div className="rounded-md border border-border/50 dark:border-border-subtle/60 bg-card/30 dark:bg-surface-2/30 p-2.5 flex flex-col">
-                    <p className="text-xs font-semibold text-foreground">
-                      {t("settingsPage.account.pricing.enterprise.name")}
-                    </p>
-                    <p className="text-[9px] text-muted-foreground mt-1">
-                      {t("settingsPage.account.pricing.enterprise.subtitle")}
-                    </p>
-                    <div className="flex items-baseline gap-0.5 mt-1">
-                      <span className="text-lg font-bold text-foreground">
-                        {t("settingsPage.account.pricing.enterprise.price")}
-                      </span>
-                    </div>
-                    <p className="text-[9px] text-muted-foreground/70 mt-1.5">
-                      {t("settingsPage.account.pricing.enterprise.includesPrefix")}
-                    </p>
-                    <ul className="space-y-0.5 mt-1 flex-1">
-                      {(
-                        t("settingsPage.account.pricing.enterprise.features", {
-                          returnObjects: true,
-                        }) as string[]
-                      ).map((feature, i) => (
-                        <li
-                          key={i}
-                          className="flex items-start gap-1 text-[10px] text-muted-foreground leading-tight"
-                        >
-                          <Check
-                            size={9}
-                            className="mt-[2px] text-purple-500 dark:text-purple-400 shrink-0"
-                          />
-                          {feature}
-                        </li>
-                      ))}
-                    </ul>
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      className="mt-2 w-full h-6 text-[10px]"
-                      onClick={() =>
-                        window.electronAPI?.openExternal?.("https://openwhispr.com/contact-sales")
-                      }
-                    >
-                      <Mail size={10} />
-                      {t("settingsPage.account.pricing.enterprise.cta")}
-                    </Button>
-                  </div>
-                </div>
-
-                <Dialog
-                  open={!!switchPreview}
-                  onOpenChange={(open) => !open && setSwitchPreview(null)}
-                >
-                  <DialogContent className="sm:max-w-[360px]">
-                    <DialogHeader>
-                      <DialogTitle>
-                        {t("settingsPage.account.pricing.confirmSwitch.title")}
-                      </DialogTitle>
-                      <DialogDescription>
-                        {switchPreview &&
-                          t("settingsPage.account.pricing.confirmSwitch.description", {
-                            plan: switchPreview.tier === "pro" ? "Pro" : "Business",
-                            interval:
-                              switchPreview.plan === "annual"
-                                ? t("settingsPage.account.pricing.confirmSwitch.yearly")
-                                : t("settingsPage.account.pricing.confirmSwitch.monthly"),
-                          })}
-                      </DialogDescription>
-                    </DialogHeader>
-                    {switchPreview && (
-                      <div className="rounded-lg border border-border/50 dark:border-border-subtle/60 overflow-hidden">
-                        <div className="flex justify-between items-center px-3 py-2.5 bg-muted/40 dark:bg-surface-2/50">
-                          <span className="text-xs text-muted-foreground">
-                            {switchPreview.immediateAmount < 0
-                              ? t("settingsPage.account.pricing.confirmSwitch.accountCredit")
-                              : t("settingsPage.account.pricing.confirmSwitch.chargeToday")}
-                          </span>
-                          <span
-                            className={cn(
-                              "text-sm font-semibold",
-                              switchPreview.immediateAmount < 0
-                                ? "text-emerald-600 dark:text-emerald-400"
-                                : "text-foreground"
-                            )}
-                          >
-                            {formatAmount(
-                              Math.abs(switchPreview.immediateAmount),
-                              switchPreview.currency
-                            )}
-                          </span>
-                        </div>
-                        <div className="divide-y divide-border/40">
-                          <div className="flex justify-between items-center px-3 py-2">
-                            <span className="text-xs text-muted-foreground">
-                              {t("settingsPage.account.pricing.confirmSwitch.newPrice")}
-                            </span>
-                            <span className="text-xs font-medium text-foreground">
-                              {formatAmount(switchPreview.newPriceAmount, switchPreview.currency)}/
-                              {switchPreview.newInterval === "year"
-                                ? t("settingsPage.account.pricing.confirmSwitch.yr")
-                                : t("settingsPage.account.pricing.confirmSwitch.mo")}
-                            </span>
-                          </div>
-                          {switchPreview.nextBillingDate && (
-                            <div className="flex justify-between items-center px-3 py-2">
-                              <span className="text-xs text-muted-foreground">
-                                {t("settingsPage.account.pricing.confirmSwitch.nextBilling")}
-                              </span>
-                              <span className="text-xs font-medium text-foreground">
-                                {new Date(switchPreview.nextBillingDate).toLocaleDateString()}
-                              </span>
-                            </div>
-                          )}
-                        </div>
-                      </div>
-                    )}
-                    <DialogFooter>
-                      <Button variant="outline" size="sm" onClick={() => setSwitchPreview(null)}>
-                        {t("settingsPage.account.pricing.confirmSwitch.cancel")}
-                      </Button>
-                      <Button
-                        size="sm"
-                        onClick={confirmSwitchPlan}
-                        disabled={usage?.checkoutLoading}
-                      >
-                        {usage?.checkoutLoading ? (
-                          <Loader2 size={14} className="animate-spin" />
-                        ) : (
-                          t("settingsPage.account.pricing.confirmSwitch.confirm")
-                        )}
-                      </Button>
-                    </DialogFooter>
-                  </DialogContent>
-                </Dialog>
-
+                {isSignedIn && <WorkspaceBillingOverview onRefreshEntitlement={usage?.refetch} />}
                 {isSignedIn ? (
-                  <>
-                    <SectionHeader title={t("settingsPage.account.planTitle")} />
-                    {!usage || !usage.hasLoaded ? (
+                  <div className="space-y-5">
+                    <SectionHeader title={t("settingsPage.unifiedBilling.personalPlanTitle")} />
+                    {usage?.status === "error" ? (
+                      <SettingsPanel>
+                        <SettingsPanelRow>
+                          <SettingsRow
+                            label={t("settingsPage.account.planUnavailable.title")}
+                            description={t("settingsPage.account.planUnavailable.description")}
+                          >
+                            <Button
+                              onClick={() => void usage.retry()}
+                              variant="outline"
+                              size="sm"
+                              disabled={usage.isRetrying}
+                            >
+                              {usage.isRetrying ? (
+                                <Loader2 size={14} className="animate-spin" />
+                              ) : (
+                                t("common.retry")
+                              )}
+                            </Button>
+                          </SettingsRow>
+                        </SettingsPanelRow>
+                      </SettingsPanel>
+                    ) : usage?.status !== "success" ? (
                       <SettingsPanel>
                         <SettingsPanelRow>
                           <div className="flex items-center justify-between">
@@ -1835,11 +2379,12 @@ export default function SettingsPage({ activeSection = "general" }: SettingsPage
                                 ? t("settingsPage.account.planLabels.trial")
                                 : usage.isPastDue
                                   ? t("settingsPage.account.planLabels.free")
-                                  : usage.isSubscribed
+                                  : usage.isPersonallySubscribed
                                     ? usage.plan === "business"
                                       ? t("settingsPage.account.planLabels.business")
                                       : t("settingsPage.account.planLabels.pro")
-                                    : t("settingsPage.account.planLabels.free")
+                                    : (coveringPlanLabel ??
+                                      t("settingsPage.account.planLabels.free"))
                             }
                             description={
                               usage.isTrial
@@ -1851,7 +2396,7 @@ export default function SettingsPage({ activeSection = "general" }: SettingsPage
                                       used: usage.wordsUsed.toLocaleString(i18n.language),
                                       limit: usage.limit.toLocaleString(i18n.language),
                                     })
-                                  : usage.isSubscribed
+                                  : usage.isPersonallySubscribed
                                     ? usage.currentPeriodEnd
                                       ? t("settingsPage.account.planDescriptions.nextBilling", {
                                           date: new Date(usage.currentPeriodEnd).toLocaleDateString(
@@ -1860,10 +2405,18 @@ export default function SettingsPage({ activeSection = "general" }: SettingsPage
                                           ),
                                         })
                                       : t("settingsPage.account.planDescriptions.unlimited")
-                                    : t("settingsPage.account.planDescriptions.freeUsage", {
-                                        used: usage.wordsUsed.toLocaleString(i18n.language),
-                                        limit: usage.limit.toLocaleString(i18n.language),
-                                      })
+                                    : coveringWorkspaceNames.length > 0
+                                      ? t("settingsPage.unifiedBilling.providedBy", {
+                                          workspaces: coveringWorkspaceNames.join(", "),
+                                        })
+                                      : // usage.limit is -1 once subscribed, which the
+                                        // free-usage copy would print as "-1 words".
+                                        isWorkspaceCovered
+                                        ? t("settingsPage.account.planDescriptions.unlimited")
+                                        : t("settingsPage.account.planDescriptions.freeUsage", {
+                                            used: usage.wordsUsed.toLocaleString(i18n.language),
+                                            limit: usage.limit.toLocaleString(i18n.language),
+                                          })
                             }
                           >
                             {usage.isTrial ? (
@@ -1872,12 +2425,14 @@ export default function SettingsPage({ activeSection = "general" }: SettingsPage
                               <Badge variant="destructive">
                                 {t("settingsPage.account.badges.pastDue")}
                               </Badge>
-                            ) : usage.isSubscribed ? (
+                            ) : usage.isPersonallySubscribed ? (
                               <Badge variant="success">
                                 {usage.plan === "business"
                                   ? t("settingsPage.account.badges.business")
                                   : t("settingsPage.account.badges.pro")}
                               </Badge>
+                            ) : coveringPlanLabel ? (
+                              <Badge variant="success">{coveringPlanLabel}</Badge>
                             ) : usage.isOverLimit ? (
                               <Badge variant="warning">
                                 {t("settingsPage.account.badges.limitReached")}
@@ -1931,23 +2486,7 @@ export default function SettingsPage({ activeSection = "general" }: SettingsPage
                         <SettingsPanelRow>
                           {usage.isPastDue ? (
                             <Button
-                              onClick={async () => {
-                                setIsOpeningBilling(true);
-                                try {
-                                  const result = await usage.openBillingPortal();
-                                  if (!result.success) {
-                                    toast({
-                                      title: t("settingsPage.account.billing.couldNotOpenTitle"),
-                                      description: t(
-                                        "settingsPage.account.billing.couldNotOpenDescription"
-                                      ),
-                                      variant: "destructive",
-                                    });
-                                  }
-                                } finally {
-                                  setIsOpeningBilling(false);
-                                }
-                              }}
+                              onClick={() => void openBillingPortal()}
                               disabled={isOpeningBilling}
                               size="sm"
                               className="w-full"
@@ -1961,36 +2500,27 @@ export default function SettingsPage({ activeSection = "general" }: SettingsPage
                                 t("settingsPage.account.billing.updatePaymentMethod")
                               )}
                             </Button>
-                          ) : usage.isSubscribed && !usage.isTrial ? (
+                          ) : usage.isPersonallySubscribed && !usage.isTrial ? (
                             <Button
-                              onClick={async () => {
-                                const result = await usage.openBillingPortal();
-                                if (!result.success) {
-                                  toast({
-                                    title: t("settingsPage.account.billing.couldNotOpenTitle"),
-                                    description: t(
-                                      "settingsPage.account.billing.couldNotOpenDescription"
-                                    ),
-                                    variant: "destructive",
-                                  });
-                                }
-                              }}
+                              onClick={() => void openBillingPortal()}
                               variant="outline"
                               size="sm"
                               className="w-full"
-                              disabled={usage.checkoutLoading}
+                              disabled={isOpeningBilling}
                             >
-                              {usage.checkoutLoading
+                              {isOpeningBilling
                                 ? t("settingsPage.account.billing.opening")
                                 : t("settingsPage.account.billing.manageBilling")}
                             </Button>
-                          ) : (
+                          ) : isWorkspaceCovered ? null : (
                             <Button
                               onClick={async () => {
+                                setCheckoutTier("plan-upgrade");
                                 const result = await usage.openCheckout({
                                   plan: billingState.pro ? "annual" : "monthly",
                                   tier: "pro",
                                 });
+                                setCheckoutTier(null);
                                 if (!result.success) {
                                   toast({
                                     title: t("settingsPage.account.checkout.couldNotOpenTitle"),
@@ -2003,9 +2533,9 @@ export default function SettingsPage({ activeSection = "general" }: SettingsPage
                               }}
                               size="sm"
                               className="w-full"
-                              disabled={usage.checkoutLoading}
+                              disabled={checkoutTier === "plan-upgrade"}
                             >
-                              {usage.checkoutLoading
+                              {checkoutTier === "plan-upgrade"
                                 ? t("settingsPage.account.checkout.opening")
                                 : t("settingsPage.account.checkout.upgradeToPro")}
                             </Button>
@@ -2013,8 +2543,471 @@ export default function SettingsPage({ activeSection = "general" }: SettingsPage
                         </SettingsPanelRow>
                       </SettingsPanel>
                     )}
-                  </>
+                  </div>
                 ) : null}
+
+                <div className="space-y-5">
+                  <SectionHeader title={t("settingsPage.account.pricing.title")} />
+                  <div className={`grid gap-1.5 ${isCompact ? "grid-cols-2" : "grid-cols-4"}`}>
+                    <div
+                      className={cn(
+                        "rounded-md p-2.5 flex flex-col",
+                        planStateKnown &&
+                          !usage?.isPersonallySubscribed &&
+                          !usage?.isTrial &&
+                          !isWorkspaceCovered
+                          ? "border-2 border-primary/30 bg-primary/3 dark:border-primary/20 dark:bg-primary/5"
+                          : "border border-border/70 dark:border-border-subtle/60 bg-card/30 dark:bg-surface-2/30"
+                      )}
+                    >
+                      <p className="text-xs font-semibold text-foreground">
+                        {t("settingsPage.account.pricing.free.name")}
+                      </p>
+                      <div className="flex items-baseline gap-0.5 mt-0.5">
+                        <span className="text-lg font-bold text-foreground">
+                          {t("settingsPage.account.pricing.free.price")}
+                        </span>
+                        <span className="text-[9px] text-muted-foreground">
+                          / {t("settingsPage.account.pricing.free.period")}
+                        </span>
+                      </div>
+                      <ul className="space-y-0.5 mt-2 flex-1">
+                        {(
+                          t("settingsPage.account.pricing.free.features", {
+                            returnObjects: true,
+                          }) as string[]
+                        ).map((feature, i) =>
+                          feature.startsWith("## ") ? (
+                            <li
+                              key={i}
+                              className={`text-[8px] font-semibold uppercase tracking-wide text-muted-foreground/70 ${i > 0 ? "pt-1.5" : ""}`}
+                            >
+                              {feature.slice(3)}
+                            </li>
+                          ) : (
+                            <li
+                              key={i}
+                              className="flex items-start gap-1 text-[10px] text-muted-foreground leading-tight"
+                            >
+                              <Check size={9} className="mt-[2px] text-primary/70 shrink-0" />
+                              {feature}
+                            </li>
+                          )
+                        )}
+                      </ul>
+                      {!isSignedIn ? (
+                        <Button
+                          onClick={startOnboarding}
+                          variant="outline"
+                          size="sm"
+                          className="mt-2 w-full h-6 text-[10px]"
+                        >
+                          {t("settingsPage.account.signedOutPlans.button")}
+                        </Button>
+                      ) : usage?.isPersonallySubscribed && !usage?.isTrial ? (
+                        <Button
+                          onClick={() => void openBillingPortal()}
+                          variant="outline"
+                          size="sm"
+                          className="mt-2 w-full h-6 text-[10px]"
+                          disabled={isOpeningBilling}
+                        >
+                          {isOpeningBilling
+                            ? t("settingsPage.account.billing.opening")
+                            : t("settingsPage.account.pricing.downgrade")}
+                        </Button>
+                      ) : planStateKnown && !isWorkspaceCovered ? (
+                        <div className="mt-2 text-center">
+                          <span className="text-[9px] font-medium text-primary/70">
+                            {t("settingsPage.account.pricing.currentPlan")}
+                          </span>
+                        </div>
+                      ) : null}
+                    </div>
+
+                    <div
+                      className={cn(
+                        "rounded-md border-2 p-2.5 flex flex-col",
+                        usage?.isPersonallySubscribed && usage?.plan === "pro"
+                          ? "border-primary/40 bg-primary/5 dark:border-primary/30 dark:bg-primary/8"
+                          : "border-primary/20 bg-primary/2 dark:border-primary/15 dark:bg-primary/3"
+                      )}
+                    >
+                      <p className="text-xs font-semibold text-foreground">
+                        {t("settingsPage.account.pricing.pro.name")}
+                      </p>
+                      <button
+                        onClick={() => setBillingState((prev) => ({ ...prev, pro: !prev.pro }))}
+                        role="switch"
+                        aria-checked={billingState.pro}
+                        className="flex items-center gap-1.5 mt-1"
+                      >
+                        <div
+                          className={`relative w-7 h-4 rounded-full transition-colors ${billingState.pro ? "bg-primary" : "bg-muted"}`}
+                        >
+                          <div
+                            className={`absolute top-0.5 start-0.5 w-3 h-3 rounded-full bg-white transition-transform ${billingState.pro ? "translate-x-3 rtl:-translate-x-3" : ""}`}
+                          />
+                        </div>
+                        <span className="text-[9px] text-muted-foreground">
+                          {t("settingsPage.account.pricing.billedYearly")}
+                        </span>
+                      </button>
+                      <div className="flex items-baseline gap-0.5 mt-1">
+                        <span className="text-lg font-bold text-foreground">
+                          {billingState.pro
+                            ? t("settingsPage.account.pricing.pro.annualEquivalent")
+                            : t("settingsPage.account.pricing.pro.monthlyPrice")}
+                        </span>
+                        <span className="text-[9px] text-muted-foreground">
+                          {t("settingsPage.account.pricing.pro.monthlyPeriod")}
+                        </span>
+                      </div>
+                      <p className="text-[9px] text-muted-foreground/70 mt-1.5">
+                        {t("settingsPage.account.pricing.pro.includesPrefix")}
+                      </p>
+                      <ul className="space-y-0.5 mt-1 flex-1">
+                        {(
+                          t("settingsPage.account.pricing.pro.features", {
+                            returnObjects: true,
+                          }) as string[]
+                        ).map((feature, i) => (
+                          <li
+                            key={i}
+                            className="flex items-start gap-1 text-[10px] text-muted-foreground leading-tight"
+                          >
+                            <Check size={9} className="mt-[2px] text-primary shrink-0" />
+                            {feature}
+                          </li>
+                        ))}
+                      </ul>
+                      {proCardCta === "currentPlan" ? (
+                        <div className="mt-2 text-center">
+                          <span className="text-[9px] font-medium text-primary">
+                            {t("settingsPage.account.pricing.currentPlan")}
+                          </span>
+                        </div>
+                      ) : proCardCta === "downgradeToPro" ? (
+                        <Button
+                          onClick={() =>
+                            handleSwitchPlan(billingState.pro ? "annual" : "monthly", "pro")
+                          }
+                          disabled={previewLoading || usage.checkoutLoading}
+                          variant="outline"
+                          size="sm"
+                          className="mt-2 w-full h-6 text-[10px]"
+                        >
+                          {previewLoading ? (
+                            <Loader2 size={10} className="animate-spin" />
+                          ) : (
+                            t("settingsPage.account.pricing.downgrade")
+                          )}
+                        </Button>
+                      ) : proCardCta === "signUp" ? (
+                        <Button
+                          onClick={startOnboarding}
+                          size="sm"
+                          className="mt-2 w-full h-6 text-[10px]"
+                        >
+                          {t("settingsPage.account.pricing.pro.cta")}
+                        </Button>
+                      ) : proCardCta === "coveredByWorkspace" ? (
+                        <div className="mt-2 text-center">
+                          <span className="text-[9px] font-medium text-primary">
+                            {t("settingsPage.account.pricing.coveredByWorkspace")}
+                          </span>
+                        </div>
+                      ) : proCardCta === "checkout" ? (
+                        <Button
+                          onClick={() =>
+                            handleCheckout(billingState.pro ? "annual" : "monthly", "pro")
+                          }
+                          disabled={checkoutTier === "pro"}
+                          size="sm"
+                          className="mt-2 w-full h-6 text-[10px]"
+                        >
+                          {checkoutTier === "pro" ? (
+                            <Loader2 size={10} className="animate-spin" />
+                          ) : (
+                            t("settingsPage.account.pricing.pro.cta")
+                          )}
+                        </Button>
+                      ) : null}
+                    </div>
+
+                    <div className="rounded-md border-2 border-primary/50 bg-primary/8 dark:border-primary/40 dark:bg-primary/10 p-2.5 flex flex-col relative">
+                      <span className="absolute -top-2.5 left-1/2 -translate-x-1/2 bg-primary text-primary-foreground text-[8px] font-semibold px-2.5 py-0.5 rounded-full whitespace-nowrap shadow-sm">
+                        {t("settingsPage.account.pricing.business.badge")}
+                      </span>
+                      <p className="text-xs font-semibold text-foreground">
+                        {t("settingsPage.account.pricing.business.name")}
+                      </p>
+                      <button
+                        onClick={() =>
+                          setBillingState((prev) => ({ ...prev, business: !prev.business }))
+                        }
+                        role="switch"
+                        aria-checked={billingState.business}
+                        className="flex items-center gap-1.5 mt-1"
+                      >
+                        <div
+                          className={`relative w-7 h-4 rounded-full transition-colors ${billingState.business ? "bg-primary" : "bg-muted"}`}
+                        >
+                          <div
+                            className={`absolute top-0.5 start-0.5 w-3 h-3 rounded-full bg-white transition-transform ${billingState.business ? "translate-x-3 rtl:-translate-x-3" : ""}`}
+                          />
+                        </div>
+                        <span className="text-[9px] text-muted-foreground">
+                          {t("settingsPage.account.pricing.billedYearly")}
+                        </span>
+                      </button>
+                      <div className="flex items-baseline gap-0.5 mt-1">
+                        <span className="text-lg font-bold text-foreground">
+                          {billingState.business
+                            ? t("settingsPage.account.pricing.business.annualEquivalent")
+                            : t("settingsPage.account.pricing.business.monthlyPrice")}
+                        </span>
+                        <span className="text-[9px] text-muted-foreground">
+                          {t("settingsPage.account.pricing.business.monthlyPeriod")}
+                        </span>
+                      </div>
+                      <p className="text-[9px] text-muted-foreground/70 mt-1.5">
+                        {t("settingsPage.account.pricing.business.includesPrefix")}
+                      </p>
+                      <ul className="space-y-0.5 mt-1 flex-1">
+                        {(
+                          t("settingsPage.account.pricing.business.features", {
+                            returnObjects: true,
+                          }) as string[]
+                        ).map((feature, i) => (
+                          <li
+                            key={i}
+                            className="flex items-start gap-1 text-[10px] text-muted-foreground leading-tight"
+                          >
+                            <Check size={9} className="mt-[2px] text-primary shrink-0" />
+                            {feature}
+                          </li>
+                        ))}
+                      </ul>
+                      {!isSignedIn ? (
+                        <Button
+                          onClick={startOnboarding}
+                          size="sm"
+                          className="mt-2 w-full h-6 text-[10px]"
+                        >
+                          {t("settingsPage.account.pricing.business.cta")}
+                        </Button>
+                      ) : (
+                        <div className="mt-2 text-center">
+                          <span className="text-[9px] font-medium text-primary">
+                            {t("settingsPage.unifiedBilling.businessWorkspaceOnly")}
+                          </span>
+                        </div>
+                      )}
+                    </div>
+
+                    <div className="rounded-md border border-border/70 dark:border-border-subtle/60 bg-card/30 dark:bg-surface-2/30 p-2.5 flex flex-col">
+                      <p className="text-xs font-semibold text-foreground">
+                        {t("settingsPage.account.pricing.enterprise.name")}
+                      </p>
+                      <p className="text-[9px] text-muted-foreground mt-1">
+                        {t("settingsPage.account.pricing.enterprise.subtitle")}
+                      </p>
+                      <div className="flex items-baseline gap-0.5 mt-1">
+                        <span className="text-lg font-bold text-foreground">
+                          {t("settingsPage.account.pricing.enterprise.price")}
+                        </span>
+                      </div>
+                      <p className="text-[9px] text-muted-foreground/70 mt-1.5">
+                        {t("settingsPage.account.pricing.enterprise.includesPrefix")}
+                      </p>
+                      <ul className="space-y-0.5 mt-1 flex-1">
+                        {(
+                          t("settingsPage.account.pricing.enterprise.features", {
+                            returnObjects: true,
+                          }) as string[]
+                        ).map((feature, i) => (
+                          <li
+                            key={i}
+                            className="flex items-start gap-1 text-[10px] text-muted-foreground leading-tight"
+                          >
+                            <Check
+                              size={9}
+                              className="mt-[2px] text-purple-500 dark:text-purple-400 shrink-0"
+                            />
+                            {feature}
+                          </li>
+                        ))}
+                      </ul>
+                      {isSignedIn && enterpriseCta.action !== "contactSales" ? (
+                        <div className="mt-2 space-y-1">
+                          <Button
+                            size="sm"
+                            className="w-full h-6 text-[10px]"
+                            onClick={() => {
+                              if (enterpriseCta.action === "openDialog") {
+                                setEnterpriseCheckoutOpen(true);
+                              } else {
+                                setEnterpriseWorkspaceCreateOpen(true);
+                              }
+                            }}
+                          >
+                            {t("settingsPage.account.pricing.enterprise.upgradeCta")}
+                          </Button>
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            className="w-full h-6 text-[10px] text-muted-foreground"
+                            onClick={() =>
+                              window.electronAPI?.openExternal?.(
+                                "https://openwhispr.com/contact-sales"
+                              )
+                            }
+                          >
+                            <Mail size={10} />
+                            {t("settingsPage.account.pricing.enterprise.cta")}
+                          </Button>
+                        </div>
+                      ) : isSignedIn ? (
+                        <div className="mt-2 space-y-1">
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            className="w-full h-6 text-[10px]"
+                            onClick={() =>
+                              window.electronAPI?.openExternal?.(
+                                "https://openwhispr.com/contact-sales"
+                              )
+                            }
+                          >
+                            <Mail size={10} />
+                            {t("settingsPage.account.pricing.enterprise.cta")}
+                          </Button>
+                          {enterpriseCta.action === "contactSales" && enterpriseCta.ownerName && (
+                            <p className="text-[10px] text-muted-foreground text-center">
+                              {t("settingsPage.account.pricing.enterprise.askOwner", {
+                                name: enterpriseCta.ownerName,
+                              })}
+                            </p>
+                          )}
+                        </div>
+                      ) : (
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          className="mt-2 w-full h-6 text-[10px]"
+                          onClick={() =>
+                            window.electronAPI?.openExternal?.(
+                              "https://openwhispr.com/contact-sales"
+                            )
+                          }
+                        >
+                          <Mail size={10} />
+                          {t("settingsPage.account.pricing.enterprise.cta")}
+                        </Button>
+                      )}
+                    </div>
+                  </div>
+
+                  <Dialog
+                    open={!!switchPreview}
+                    onOpenChange={(open) => !open && setSwitchPreview(null)}
+                  >
+                    <DialogContent className="sm:max-w-90">
+                      <DialogHeader>
+                        <DialogTitle>
+                          {t("settingsPage.account.pricing.confirmSwitch.title")}
+                        </DialogTitle>
+                        <DialogDescription>
+                          {switchPreview &&
+                            t("settingsPage.account.pricing.confirmSwitch.description", {
+                              plan: switchPreview.tier === "pro" ? "Pro" : "Business",
+                              interval:
+                                switchPreview.plan === "annual"
+                                  ? t("settingsPage.account.pricing.confirmSwitch.yearly")
+                                  : t("settingsPage.account.pricing.confirmSwitch.monthly"),
+                            })}
+                        </DialogDescription>
+                      </DialogHeader>
+                      {switchPreview && (
+                        <div className="rounded-lg border border-border/70 dark:border-border-subtle/60 overflow-hidden">
+                          <div className="flex justify-between items-center px-3 py-2.5 bg-muted/40 dark:bg-surface-2/50">
+                            <span className="text-xs text-muted-foreground">
+                              {switchPreview.immediateAmount < 0
+                                ? t("settingsPage.account.pricing.confirmSwitch.accountCredit")
+                                : t("settingsPage.account.pricing.confirmSwitch.chargeToday")}
+                            </span>
+                            <span
+                              className={cn(
+                                "text-sm font-semibold",
+                                switchPreview.immediateAmount < 0
+                                  ? "text-emerald-600 dark:text-emerald-400"
+                                  : "text-foreground"
+                              )}
+                            >
+                              {formatAmount(
+                                Math.abs(switchPreview.immediateAmount),
+                                switchPreview.currency
+                              )}
+                            </span>
+                          </div>
+                          <div className="divide-y divide-border/60">
+                            <div className="flex justify-between items-center px-3 py-2">
+                              <span className="text-xs text-muted-foreground">
+                                {t("settingsPage.account.pricing.confirmSwitch.newPrice")}
+                              </span>
+                              <span className="text-xs font-medium text-foreground">
+                                {formatAmount(switchPreview.newPriceAmount, switchPreview.currency)}
+                                /
+                                {switchPreview.newInterval === "year"
+                                  ? t("settingsPage.account.pricing.confirmSwitch.yr")
+                                  : t("settingsPage.account.pricing.confirmSwitch.mo")}
+                              </span>
+                            </div>
+                            {switchPreview.nextBillingDate && (
+                              <div className="flex justify-between items-center px-3 py-2">
+                                <span className="text-xs text-muted-foreground">
+                                  {t("settingsPage.account.pricing.confirmSwitch.nextBilling")}
+                                </span>
+                                <span className="text-xs font-medium text-foreground">
+                                  {new Date(switchPreview.nextBillingDate).toLocaleDateString()}
+                                </span>
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      )}
+                      <DialogFooter>
+                        <Button variant="outline" size="sm" onClick={() => setSwitchPreview(null)}>
+                          {t("settingsPage.account.pricing.confirmSwitch.cancel")}
+                        </Button>
+                        <Button
+                          size="sm"
+                          onClick={confirmSwitchPlan}
+                          disabled={usage?.checkoutLoading}
+                        >
+                          {usage?.checkoutLoading ? (
+                            <Loader2 size={14} className="animate-spin" />
+                          ) : (
+                            t("settingsPage.account.pricing.confirmSwitch.confirm")
+                          )}
+                        </Button>
+                      </DialogFooter>
+                    </DialogContent>
+                  </Dialog>
+
+                  <EnterpriseCheckoutDialog
+                    open={enterpriseCheckoutOpen}
+                    onOpenChange={setEnterpriseCheckoutOpen}
+                    workspaces={billingWorkspaces}
+                    onRefreshEntitlement={usage?.refetch}
+                  />
+                  <CreateWorkspaceDialog
+                    open={enterpriseWorkspaceCreateOpen}
+                    onOpenChange={setEnterpriseWorkspaceCreateOpen}
+                    onCreated={() => setEnterpriseCheckoutOpen(true)}
+                  />
+                </div>
               </>
             ) : (
               <>
@@ -2031,6 +3024,9 @@ export default function SettingsPage({ activeSection = "general" }: SettingsPage
             )}
           </div>
         );
+
+      case "workspace":
+        return <WorkspaceSection initialSubTab={initialSubTab} />;
 
       case "general":
         return (
@@ -2117,26 +3113,49 @@ export default function SettingsPage({ activeSection = "general" }: SettingsPage
               </SettingsPanel>
             </div>
 
-            {/* Meeting Detection */}
+            {/* Notifications */}
             <div>
               <SectionHeader
-                title={t("calendar.detection.title")}
-                description={t("calendar.detection.description")}
+                title={t("settingsPage.general.notifications.title")}
+                description={t("settingsPage.general.notifications.description")}
               />
               <SettingsPanel>
                 <SettingsPanelRow>
                   <SettingsRow
-                    label={t("calendar.detection.audioDetection")}
-                    description={t("calendar.detection.audioDescription")}
+                    label={t("settingsPage.general.notifications.disableAll")}
+                    description={t("settingsPage.general.notifications.disableAllDescription")}
                   >
                     <Toggle
-                      checked={meetingAudioDetection}
-                      onChange={(value) => {
-                        setMeetingAudioDetection(value);
-                        window.electronAPI?.meetingDetectionSetPreferences?.({
-                          audioDetection: value,
-                        });
-                      }}
+                      checked={!notificationsEnabled}
+                      onChange={(v) => setNotificationsEnabled(!v)}
+                    />
+                  </SettingsRow>
+                </SettingsPanelRow>
+                <SettingsPanelRow>
+                  <SettingsRow
+                    label={t("settingsPage.general.notifications.meetingDetection")}
+                    description={t(
+                      "settingsPage.general.notifications.meetingDetectionDescription"
+                    )}
+                  >
+                    <Toggle
+                      checked={notifyMeetingDetection}
+                      onChange={setNotifyMeetingDetection}
+                      disabled={!notificationsEnabled}
+                    />
+                  </SettingsRow>
+                </SettingsPanelRow>
+                <SettingsPanelRow>
+                  <SettingsRow
+                    label={t("settingsPage.general.notifications.calendarReminders")}
+                    description={t(
+                      "settingsPage.general.notifications.calendarRemindersDescription"
+                    )}
+                  >
+                    <Toggle
+                      checked={notifyCalendarReminders}
+                      onChange={setNotifyCalendarReminders}
+                      disabled={!notificationsEnabled}
                     />
                   </SettingsRow>
                 </SettingsPanelRow>
@@ -2147,6 +3166,14 @@ export default function SettingsPage({ activeSection = "general" }: SettingsPage
             <div>
               <SectionHeader title={t("settingsPage.general.clipboard.title")} />
               <SettingsPanel>
+                <SettingsPanelRow>
+                  <SettingsRow
+                    label={t("settingsPage.general.clipboard.autoPaste")}
+                    description={t("settingsPage.general.clipboard.autoPasteDescription")}
+                  >
+                    <Toggle checked={autoPasteEnabled} onChange={setAutoPasteEnabled} />
+                  </SettingsRow>
+                </SettingsPanelRow>
                 <SettingsPanelRow>
                   <SettingsRow
                     label={t("settingsPage.general.clipboard.keepInClipboard")}
@@ -2160,6 +3187,67 @@ export default function SettingsPage({ activeSection = "general" }: SettingsPage
                 </SettingsPanelRow>
               </SettingsPanel>
             </div>
+
+            {/* Save Notes as Files */}
+            <div>
+              <SectionHeader title={t("settings.noteFiles.title")} />
+              <SettingsPanel>
+                <SettingsPanelRow>
+                  <SettingsRow
+                    label={t("settings.noteFiles.title")}
+                    description={t("settings.noteFiles.description")}
+                  >
+                    <Toggle checked={noteFilesEnabled} onChange={handleNoteFilesToggle} />
+                  </SettingsRow>
+                </SettingsPanelRow>
+                {noteFilesEnabled && (
+                  <>
+                    <SettingsPanelRow>
+                      <SettingsRow
+                        label={t("settings.noteFiles.path")}
+                        description={
+                          <span dir="ltr" className="block break-all">
+                            {noteFilesPath || noteFilesDefaultPath || "..."}
+                          </span>
+                        }
+                      >
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          className="h-7 text-xs"
+                          onClick={handleNoteFilesChangePath}
+                        >
+                          {t("settings.noteFiles.changePath")}
+                        </Button>
+                      </SettingsRow>
+                    </SettingsPanelRow>
+                    <SettingsPanelRow>
+                      <SettingsRow
+                        label={t("settings.noteFiles.rebuild")}
+                        description={t("settings.noteFiles.rebuildDescription")}
+                      >
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          className="h-7 text-xs"
+                          disabled={noteFilesRebuilding}
+                          onClick={handleNoteFilesRebuild}
+                        >
+                          {noteFilesRebuilding ? (
+                            <Loader2 className="h-3 w-3 animate-spin" />
+                          ) : (
+                            t("settings.noteFiles.rebuild")
+                          )}
+                        </Button>
+                      </SettingsRow>
+                    </SettingsPanelRow>
+                  </>
+                )}
+              </SettingsPanel>
+            </div>
+
+            {/* Import from Granola */}
+            <GranolaImportSection showAlertDialog={showAlertDialog} />
 
             {/* Floating Icon */}
             <div>
@@ -2238,6 +3326,36 @@ export default function SettingsPage({ activeSection = "general" }: SettingsPage
                     />
                   </SettingsRow>
                 </SettingsPanelRow>
+                {preferredLanguage === "auto" && (
+                  <SettingsPanelRow>
+                    <SettingsRow
+                      label={t("settings.language.chineseScriptLabel")}
+                      description={t("settings.language.chineseScriptDescription")}
+                    >
+                      <Select
+                        value={chineseScriptPreference}
+                        onValueChange={(value: ChineseScriptPreference) =>
+                          updateTranscriptionSettings({ chineseScriptPreference: value })
+                        }
+                      >
+                        <SelectTrigger className="h-7 w-44 text-xs rounded-lg px-2.5 [&>svg]:h-3 [&>svg]:w-3">
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="as-transcribed">
+                            {t("settings.language.chineseScriptAsTranscribed")}
+                          </SelectItem>
+                          <SelectItem value="simplified">
+                            {t("settings.language.chineseScriptSimplified")}
+                          </SelectItem>
+                          <SelectItem value="traditional">
+                            {t("settings.language.chineseScriptTraditional")}
+                          </SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </SettingsRow>
+                  </SettingsPanelRow>
+                )}
               </SettingsPanel>
             </div>
 
@@ -2248,18 +3366,39 @@ export default function SettingsPage({ activeSection = "general" }: SettingsPage
                 description={t("settingsPage.general.startup.description")}
               />
               <SettingsPanel>
-                {platform !== "linux" && (
+                <SettingsPanelRow>
+                  <SettingsRow
+                    label={t("settingsPage.general.startup.launchAtLogin")}
+                    description={t("settingsPage.general.startup.launchAtLoginDescription")}
+                  >
+                    <Toggle
+                      checked={autoStartEnabled}
+                      onChange={(checked: boolean) => handleAutoStartChange(checked)}
+                      disabled={autoStartLoading}
+                    />
+                  </SettingsRow>
+                </SettingsPanelRow>
+                {autoStartNeedsApproval && (
                   <SettingsPanelRow>
-                    <SettingsRow
-                      label={t("settingsPage.general.startup.launchAtLogin")}
-                      description={t("settingsPage.general.startup.launchAtLoginDescription")}
+                    <Alert
+                      variant="warning"
+                      className="dark:bg-amber-950/50 dark:border-amber-800 dark:text-amber-200 dark:[&>svg]:text-amber-400"
                     >
-                      <Toggle
-                        checked={autoStartEnabled}
-                        onChange={(checked: boolean) => handleAutoStartChange(checked)}
-                        disabled={autoStartLoading}
-                      />
-                    </SettingsRow>
+                      <AlertTriangle className="h-4 w-4" />
+                      <AlertTitle>
+                        {t("settingsPage.general.startup.needsApproval.title")}
+                      </AlertTitle>
+                      <AlertDescription className="space-y-2">
+                        <p>{t("settingsPage.general.startup.needsApproval.description")}</p>
+                        <Button
+                          onClick={() => void window.electronAPI?.openLoginItemsSettings?.()}
+                          variant="outline"
+                          size="sm"
+                        >
+                          {t("settingsPage.general.startup.needsApproval.action")}
+                        </Button>
+                      </AlertDescription>
+                    </Alert>
                   </SettingsPanelRow>
                 )}
                 <SettingsPanelRow>
@@ -2282,10 +3421,13 @@ export default function SettingsPage({ activeSection = "general" }: SettingsPage
               <SettingsPanel>
                 <SettingsPanelRow>
                   <MicrophoneSettings
-                    preferBuiltInMic={preferBuiltInMic}
+                    microphoneSelectionMode={microphoneSelectionMode}
                     selectedMicDeviceId={selectedMicDeviceId}
-                    onPreferBuiltInChange={setPreferBuiltInMic}
-                    onDeviceSelect={setSelectedMicDeviceId}
+                    selectedMicDeviceLabel={selectedMicDeviceLabel}
+                    micWarmHoldSeconds={micWarmHoldSeconds}
+                    onSelectionModeChange={setMicrophoneSelectionMode}
+                    onDeviceSelect={setSelectedMicDevice}
+                    onMicWarmHoldSecondsChange={setMicWarmHoldSeconds}
                   />
                 </SettingsPanelRow>
               </SettingsPanel>
@@ -2324,15 +3466,39 @@ export default function SettingsPage({ activeSection = "general" }: SettingsPage
                   })}
                   description={t("settingsPage.general.waylandPaste.description", {
                     defaultValue:
-                      "Auto-paste on Wayland requires ydotool. Check the status of each component below.",
+                      "Auto-paste on Wayland uses ydotool or wtype. wtype is preferred on wlroots compositors.",
                   })}
                 />
                 {(() => {
+                  if (ydotoolStatus.isNixOS) {
+                    return (
+                      <NixOsPasteInfo status={ydotoolStatus} onRecheck={refreshYdotoolStatus} />
+                    );
+                  }
                   const checks = [
+                    {
+                      key: "hasWtype",
+                      label: "wtype",
+                      ok: ydotoolStatus.hasWtype,
+                      required: ydotoolStatus.isWlroots,
+                      desc: t("settingsPage.general.waylandPaste.wtypeDesc"),
+                      steps: [
+                        {
+                          title: t("settingsPage.general.waylandPaste.guide.wtype.step1Title"),
+                          desc: t("settingsPage.general.waylandPaste.guide.wtype.step1Desc"),
+                          cmds: getLinuxPasteInstallCommands(t, "wtype"),
+                        },
+                        {
+                          title: t("settingsPage.general.waylandPaste.guide.wtype.step2Title"),
+                          cmds: [{ cmd: "which wtype" }],
+                        },
+                      ],
+                    },
                     {
                       key: "hasYdotool",
                       label: "ydotool",
                       ok: ydotoolStatus.hasYdotool,
+                      required: !ydotoolStatus.isWlroots,
                       desc: t("settingsPage.general.waylandPaste.ydotoolDesc", {
                         defaultValue: "Input automation tool for Wayland",
                       }),
@@ -2345,11 +3511,7 @@ export default function SettingsPage({ activeSection = "general" }: SettingsPage
                             defaultValue:
                               "Use your distribution's package manager to install ydotool.",
                           }),
-                          cmds: [
-                            { label: "Ubuntu / Pop!_OS / Debian", cmd: "sudo apt install ydotool" },
-                            { label: "Fedora", cmd: "sudo dnf install ydotool" },
-                            { label: "openSUSE", cmd: "sudo zypper install ydotool" },
-                          ],
+                          cmds: getLinuxPasteInstallCommands(t, "ydotool"),
                         },
                         {
                           title: t("settingsPage.general.waylandPaste.guide.ydotool.step2Title", {
@@ -2366,6 +3528,7 @@ export default function SettingsPage({ activeSection = "general" }: SettingsPage
                       key: "hasYdotoold",
                       label: "ydotoold",
                       ok: ydotoolStatus.hasYdotoold,
+                      required: !ydotoolStatus.isWlroots,
                       desc: t("settingsPage.general.waylandPaste.ydotooldDesc", {
                         defaultValue: "Daemon for ydotool (separate package on Ubuntu/Pop!_OS)",
                       }),
@@ -2384,6 +3547,7 @@ export default function SettingsPage({ activeSection = "general" }: SettingsPage
                               cmd: "sudo apt install ydotoold",
                             },
                             { label: "Fedora", cmd: "# Already included in the ydotool package" },
+                            { label: "Arch Linux", cmd: "# Included in the ydotool package" },
                           ],
                         },
                       ],
@@ -2392,6 +3556,7 @@ export default function SettingsPage({ activeSection = "general" }: SettingsPage
                       key: "hasUinput",
                       label: "/dev/uinput",
                       ok: ydotoolStatus.hasUinput,
+                      required: !ydotoolStatus.isWlroots,
                       desc: t("settingsPage.general.waylandPaste.uinputDesc", {
                         defaultValue: "Kernel input device access",
                       }),
@@ -2491,6 +3656,7 @@ export default function SettingsPage({ activeSection = "general" }: SettingsPage
                         defaultValue: "input group",
                       }),
                       ok: ydotoolStatus.hasGroup,
+                      required: !ydotoolStatus.isWlroots,
                       desc: t("settingsPage.general.waylandPaste.inputGroupDesc", {
                         defaultValue: "User must be in the input group (requires re-login)",
                       }),
@@ -2518,6 +3684,7 @@ export default function SettingsPage({ activeSection = "general" }: SettingsPage
                         defaultValue: "systemd service",
                       }),
                       ok: ydotoolStatus.hasService,
+                      required: !ydotoolStatus.isWlroots,
                       desc: t("settingsPage.general.waylandPaste.serviceDesc", {
                         defaultValue: "User service file for auto-starting ydotoold",
                       }),
@@ -2573,6 +3740,7 @@ EOF`,
                         defaultValue: "ydotoold daemon",
                       }),
                       ok: ydotoolStatus.daemonRunning,
+                      required: !ydotoolStatus.isWlroots,
                       desc: t("settingsPage.general.waylandPaste.daemonDesc", {
                         defaultValue: "Background service must be running",
                       }),
@@ -2588,13 +3756,23 @@ EOF`,
                             {
                               cmd: "systemctl --user enable ydotoold && systemctl --user start ydotoold",
                             },
+                            {
+                              label: "Arch Linux (service is named ydotool.service)",
+                              cmd: "systemctl --user enable --now ydotool.service",
+                            },
                           ],
                         },
                         {
                           title: t("settingsPage.general.waylandPaste.guide.daemon.step2Title", {
                             defaultValue: "Verify it's running",
                           }),
-                          cmds: [{ cmd: "systemctl --user status ydotoold" }],
+                          cmds: [
+                            { cmd: "systemctl --user status ydotoold" },
+                            {
+                              label: "Arch Linux",
+                              cmd: "systemctl --user status ydotool.service",
+                            },
+                          ],
                         },
                       ],
                     },
@@ -2605,10 +3783,11 @@ EOF`,
                       key: "hasXclip",
                       label: "xclip",
                       ok: ydotoolStatus.hasXclip || ydotoolStatus.hasXsel || false,
+                      required: true,
                       desc: t("settingsPage.general.waylandPaste.xclipDesc", {
                         defaultValue: "Clipboard tool for KDE Wayland paste (xclip or xsel)",
                       }),
-                      guide: [
+                      steps: [
                         {
                           title: t("settingsPage.general.waylandPaste.guide.xclip.step1Title", {
                             defaultValue: "Install xclip",
@@ -2622,7 +3801,7 @@ EOF`,
                     });
                   }
 
-                  const allOk = checks.every((c) => c.ok);
+                  const allOk = checks.filter((c) => c.required).every((c) => c.ok);
                   const activeGuide = checks.find((c) => c.key === ydotoolGuideKey);
 
                   return (
@@ -2662,7 +3841,7 @@ EOF`,
                                     )}
                                     <div className="flex-1 min-w-0">
                                       <span className="text-sm font-medium">{item.label}</span>
-                                      <span className="text-xs text-muted-foreground ml-2">
+                                      <span className="text-xs text-muted-foreground ms-2">
                                         {item.desc}
                                       </span>
                                       {item.note && (
@@ -2738,7 +3917,10 @@ EOF`,
                                                   </p>
                                                 )}
                                                 <div className="flex items-start gap-1.5">
-                                                  <pre className="flex-1 text-[11px] bg-muted/60 rounded-md px-3 py-2 font-mono whitespace-pre-wrap break-all select-all overflow-x-auto">
+                                                  <pre
+                                                    dir="ltr"
+                                                    className="flex-1 text-[11px] bg-muted/60 rounded-md px-3 py-2 font-mono whitespace-pre-wrap break-all select-all overflow-x-auto"
+                                                  >
                                                     {c.cmd}
                                                   </pre>
                                                   <button
@@ -2778,43 +3960,122 @@ EOF`,
       case "hotkeys":
         return (
           <div className="space-y-6">
+            {isUsingHyprland && hyprlandConfigStatus && !hyprlandConfigStatus.canWrite && (
+              <Alert>
+                <Info className="h-4 w-4" />
+                <AlertTitle>
+                  {t("settingsPage.general.hotkey.hyprlandConfigWriteWarningTitle")}
+                </AlertTitle>
+                <AlertDescription>
+                  <BidiInterpolatedText
+                    text={t("settingsPage.general.hotkey.hyprlandConfigWriteWarningDescription", {
+                      path: BIDI_VALUE_TOKEN,
+                    })}
+                    value={hyprlandConfigStatus.path}
+                  />
+                </AlertDescription>
+              </Alert>
+            )}
             {/* Dictation Hotkey */}
             <div>
               <SectionHeader
                 title={t("settingsPage.general.hotkey.title")}
                 description={t("settingsPage.general.hotkey.description")}
+                note={isUsingHyprland && t("settingsPage.general.hotkey.hyprlandUnbindDescription")}
               />
               <SettingsPanel>
                 <SettingsPanelRow>
-                  <HotkeyInput
+                  <HotkeyListInput
                     value={dictationKey}
-                    onChange={async (newHotkey) => {
-                      await registerHotkey(newHotkey);
-                    }}
-                    disabled={isHotkeyRegistering}
+                    onChange={(list) => registerHotkey(list)}
                     validate={validateDictationHotkey}
+                    disabled={isHotkeyRegistering}
+                    maxHotkeys={isUsingNativeShortcut ? 1 : undefined}
+                    required
+                    footerEnd={
+                      effectiveDefaultHotkey &&
+                      dictationKey &&
+                      dictationKey !== effectiveDefaultHotkey ? (
+                        <button
+                          onClick={() => registerHotkey(effectiveDefaultHotkey)}
+                          disabled={isHotkeyRegistering}
+                          className="text-xs text-muted-foreground/70 hover:text-foreground transition-colors disabled:opacity-50"
+                        >
+                          <BidiInterpolatedText
+                            text={t("settingsPage.general.hotkey.resetToDefault", {
+                              hotkey: BIDI_VALUE_TOKEN,
+                            })}
+                            value={formatHotkeyLabel(effectiveDefaultHotkey)}
+                          />
+                        </button>
+                      ) : null
+                    }
                   />
-                  {dictationKey && dictationKey !== getDefaultHotkey() && (
-                    <button
-                      onClick={() => registerHotkey(getDefaultHotkey())}
-                      disabled={isHotkeyRegistering}
-                      className="mt-2 text-xs text-muted-foreground/70 hover:text-foreground transition-colors disabled:opacity-50"
-                    >
-                      {t("settingsPage.general.hotkey.resetToDefault", {
-                        hotkey: formatHotkeyLabel(getDefaultHotkey()),
-                      })}
-                    </button>
-                  )}
                 </SettingsPanelRow>
 
-                {!isUsingNativeShortcut && (
+                {(!isUsingNativeShortcut || getCachedPlatform() === "linux") && (
                   <SettingsPanelRow>
-                    <p className="text-xs font-medium text-muted-foreground/80 mb-2">
-                      {t("settingsPage.general.hotkey.activationMode")}
-                    </p>
-                    <ActivationModeSelector value={activationMode} onChange={setActivationMode} />
+                    <div className="flex items-center justify-between gap-3">
+                      <span className="text-xs text-muted-foreground/80">
+                        {t("settingsPage.general.hotkey.activationMode")}
+                      </span>
+                      <ActivationModeSelector
+                        value={activationMode}
+                        onChange={setActivationMode}
+                        pushDisabledReason={
+                          !supportsPushToTalk
+                            ? pushToTalkUnavailableReason || t("windows.pttUnavailable")
+                            : undefined
+                        }
+                      />
+                    </div>
+                    {getCachedPlatform() === "linux" && activationMode === "push" && (
+                      <LinuxPttSetupInfo isAvailable={linuxPttAvailable} />
+                    )}
                   </SettingsPanelRow>
                 )}
+              </SettingsPanel>
+            </div>
+
+            {/* Voice Agent Hotkey */}
+            {agentAllowedByPolicy && (
+              <div>
+                <SectionHeader
+                  title={t("settingsPage.general.voiceAgentHotkey.title")}
+                  description={t("settingsPage.general.voiceAgentHotkey.description")}
+                />
+                <SettingsPanel>
+                  <SettingsPanelRow>
+                    <HotkeyListInput
+                      value={voiceAgentKey}
+                      onChange={(list) => commitAgentHotkey(setVoiceAgentKey, list)}
+                      onClear={() => commitAgentHotkey(setVoiceAgentKey, "")}
+                      validate={validateVoiceAgentHotkey}
+                      disabled={isAgentHotkeyCommitting}
+                      maxHotkeys={isUsingNativeShortcut ? 1 : undefined}
+                    />
+                  </SettingsPanelRow>
+                </SettingsPanel>
+              </div>
+            )}
+
+            {/* Translation Hotkey */}
+            <div>
+              <SectionHeader
+                title={t("settingsPage.general.translationHotkey.title")}
+                description={t("settingsPage.general.translationHotkey.description")}
+              />
+              <SettingsPanel>
+                <SettingsPanelRow>
+                  <HotkeyListInput
+                    value={translationKey}
+                    onChange={(list) => commitAgentHotkey(setTranslationKey, list)}
+                    onClear={() => commitAgentHotkey(setTranslationKey, "")}
+                    validate={validateTranslationHotkey}
+                    disabled={isAgentHotkeyCommitting}
+                    maxHotkeys={isUsingNativeShortcut ? 1 : undefined}
+                  />
+                </SettingsPanelRow>
               </SettingsPanel>
             </div>
 
@@ -2826,346 +4087,55 @@ EOF`,
               />
               <SettingsPanel>
                 <SettingsPanelRow>
-                  <HotkeyInput
+                  <HotkeyListInput
                     value={meetingKey}
-                    onChange={async (newHotkey) => {
-                      await registerMeetingHotkey(newHotkey);
+                    onChange={(list) => registerMeetingHotkey(list)}
+                    onClear={async () => {
+                      await window.electronAPI?.registerMeetingHotkey?.("");
+                      setMeetingKey("");
                     }}
-                    disabled={isMeetingHotkeyRegistering}
                     validate={validateMeetingHotkey}
+                    disabled={isMeetingHotkeyRegistering}
+                    maxHotkeys={isUsingNativeShortcut ? 1 : undefined}
                   />
-                  {meetingKey && (
-                    <button
-                      onClick={async () => {
-                        await window.electronAPI?.registerMeetingHotkey?.("");
-                        setMeetingKey("");
-                      }}
-                      disabled={isMeetingHotkeyRegistering}
-                      className="mt-2 text-xs text-muted-foreground/70 hover:text-foreground transition-colors disabled:opacity-50"
-                    >
-                      {t("settingsPage.general.meetingHotkey.clear")}
-                    </button>
-                  )}
                 </SettingsPanelRow>
-              </SettingsPanel>
-            </div>
-          </div>
-        );
-
-      case "transcription":
-        return (
-          <TranscriptionSection
-            isSignedIn={isSignedIn ?? false}
-            cloudTranscriptionMode={cloudTranscriptionMode}
-            setCloudTranscriptionMode={setCloudTranscriptionMode}
-            useLocalWhisper={useLocalWhisper}
-            setUseLocalWhisper={setUseLocalWhisper}
-            updateTranscriptionSettings={updateTranscriptionSettings}
-            cloudTranscriptionProvider={cloudTranscriptionProvider}
-            setCloudTranscriptionProvider={setCloudTranscriptionProvider}
-            cloudTranscriptionModel={cloudTranscriptionModel}
-            setCloudTranscriptionModel={setCloudTranscriptionModel}
-            localTranscriptionProvider={localTranscriptionProvider}
-            setLocalTranscriptionProvider={setLocalTranscriptionProvider}
-            whisperModel={whisperModel}
-            setWhisperModel={setWhisperModel}
-            parakeetModel={parakeetModel}
-            setParakeetModel={setParakeetModel}
-            openaiApiKey={openaiApiKey}
-            setOpenaiApiKey={setOpenaiApiKey}
-            groqApiKey={groqApiKey}
-            setGroqApiKey={setGroqApiKey}
-            mistralApiKey={mistralApiKey}
-            setMistralApiKey={setMistralApiKey}
-            customTranscriptionApiKey={customTranscriptionApiKey}
-            setCustomTranscriptionApiKey={setCustomTranscriptionApiKey}
-            cloudTranscriptionBaseUrl={cloudTranscriptionBaseUrl}
-            setCloudTranscriptionBaseUrl={setCloudTranscriptionBaseUrl}
-            toast={toast}
-          />
-        );
-
-      case "aiModels":
-        return (
-          <AiModelsSection
-            isSignedIn={isSignedIn ?? false}
-            cloudReasoningMode={cloudReasoningMode}
-            setCloudReasoningMode={setCloudReasoningMode}
-            useReasoningModel={useReasoningModel}
-            setUseReasoningModel={(value) => {
-              setUseReasoningModel(value);
-              updateReasoningSettings({ useReasoningModel: value });
-            }}
-            reasoningModel={reasoningModel}
-            setReasoningModel={setReasoningModel}
-            reasoningProvider={reasoningProvider}
-            setReasoningProvider={setReasoningProvider}
-            cloudReasoningBaseUrl={cloudReasoningBaseUrl}
-            setCloudReasoningBaseUrl={setCloudReasoningBaseUrl}
-            openaiApiKey={openaiApiKey}
-            setOpenaiApiKey={setOpenaiApiKey}
-            anthropicApiKey={anthropicApiKey}
-            setAnthropicApiKey={setAnthropicApiKey}
-            geminiApiKey={geminiApiKey}
-            setGeminiApiKey={setGeminiApiKey}
-            groqApiKey={groqApiKey}
-            setGroqApiKey={setGroqApiKey}
-            customReasoningApiKey={customReasoningApiKey}
-            setCustomReasoningApiKey={setCustomReasoningApiKey}
-            toast={toast}
-          />
-        );
-
-      case "agentConfig":
-        return (
-          <div className="space-y-5">
-            <SectionHeader
-              title={t("settingsPage.agentConfig.title")}
-              description={t("settingsPage.agentConfig.description")}
-            />
-
-            {/* Agent Name */}
-            <div>
-              <p className="text-[13px] font-medium text-foreground mb-3">
-                {t("settingsPage.agentConfig.agentName")}
-              </p>
-              <SettingsPanel>
-                <SettingsPanelRow>
-                  <div className="space-y-3">
-                    <div className="flex gap-2">
-                      <Input
-                        placeholder={t("settingsPage.agentConfig.placeholder")}
-                        value={agentNameInput}
-                        onChange={(e) => setAgentNameInput(e.target.value)}
-                        className="flex-1 text-center text-base font-mono"
-                      />
-                      <Button
-                        onClick={handleSaveAgentName}
-                        disabled={!agentNameInput.trim()}
-                        size="sm"
+                <SettingsPanelRow className="flex items-center justify-between gap-3 border-t border-border/70 dark:border-white/10">
+                  <span className="text-xs text-muted-foreground/80">
+                    {t("settingsPage.general.meetingHotkey.layoutLabel")}
+                  </span>
+                  <Select
+                    value={meetingHotkeyLayoutMode}
+                    onValueChange={(value) =>
+                      setMeetingHotkeyLayoutMode(value as "side-panel" | "full-width")
+                    }
+                  >
+                    <SelectTrigger className="h-7 w-36 text-xs rounded-lg px-2.5 [&>svg]:h-3 [&>svg]:w-3">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem
+                        value="full-width"
+                        className="text-xs py-1.5 ps-2.5 pe-7 rounded-md"
                       >
-                        {t("settingsPage.agentConfig.save")}
-                      </Button>
-                    </div>
-                    <p className="text-[11px] text-muted-foreground/60">
-                      {t("settingsPage.agentConfig.helper")}
-                    </p>
-                  </div>
-                </SettingsPanelRow>
-              </SettingsPanel>
-            </div>
-
-            {/* How it works */}
-            <div>
-              <SectionHeader title={t("settingsPage.agentConfig.howItWorksTitle")} />
-              <SettingsPanel>
-                <SettingsPanelRow>
-                  <p className="text-[12px] text-muted-foreground leading-relaxed">
-                    {t("settingsPage.agentConfig.howItWorksDescription", { agentName })}
-                  </p>
-                </SettingsPanelRow>
-              </SettingsPanel>
-            </div>
-
-            {/* Examples */}
-            <div>
-              <SectionHeader title={t("settingsPage.agentConfig.examplesTitle")} />
-              <SettingsPanel>
-                <SettingsPanelRow>
-                  <div className="space-y-2.5">
-                    {[
-                      {
-                        input: `Hey ${agentName}, write a formal email about the budget`,
-                        mode: t("settingsPage.agentConfig.instructionMode"),
-                      },
-                      {
-                        input: `Hey ${agentName}, make this more professional`,
-                        mode: t("settingsPage.agentConfig.instructionMode"),
-                      },
-                      {
-                        input: `Hey ${agentName}, convert this to bullet points`,
-                        mode: t("settingsPage.agentConfig.instructionMode"),
-                      },
-                      {
-                        input: t("settingsPage.agentConfig.cleanupExample"),
-                        mode: t("settingsPage.agentConfig.cleanupMode"),
-                      },
-                    ].map((example, i) => (
-                      <div key={i} className="flex items-start gap-3">
-                        <span
-                          className={`shrink-0 mt-0.5 text-[10px] font-medium uppercase tracking-wider px-1.5 py-px rounded ${
-                            example.mode === t("settingsPage.agentConfig.instructionMode")
-                              ? "bg-primary/10 text-primary dark:bg-primary/15"
-                              : "bg-muted text-muted-foreground"
-                          }`}
-                        >
-                          {example.mode}
-                        </span>
-                        <p className="text-[12px] text-muted-foreground leading-relaxed">
-                          "{example.input}"
-                        </p>
-                      </div>
-                    ))}
-                  </div>
+                        {t("settingsPage.general.meetingHotkey.layoutFullWidth")}
+                      </SelectItem>
+                      <SelectItem
+                        value="side-panel"
+                        className="text-xs py-1.5 ps-2.5 pe-7 rounded-md"
+                      >
+                        {t("settingsPage.general.meetingHotkey.layoutSidePanel")}
+                      </SelectItem>
+                    </SelectContent>
+                  </Select>
                 </SettingsPanelRow>
               </SettingsPanel>
             </div>
           </div>
         );
 
-      case "prompts":
-        return (
-          <div className="space-y-5">
-            <SectionHeader
-              title={t("settingsPage.prompts.title")}
-              description={t("settingsPage.prompts.description")}
-            />
-
-            <PromptStudio />
-          </div>
-        );
-
-      case "intelligence":
-        return (
-          <div className="space-y-6">
-            {/* Text Cleanup (AI Models) */}
-            <AiModelsSection
-              isSignedIn={isSignedIn ?? false}
-              cloudReasoningMode={cloudReasoningMode}
-              setCloudReasoningMode={setCloudReasoningMode}
-              useReasoningModel={useReasoningModel}
-              setUseReasoningModel={(value) => {
-                updateReasoningSettings({ useReasoningModel: value });
-              }}
-              reasoningModel={reasoningModel}
-              setReasoningModel={setReasoningModel}
-              reasoningProvider={reasoningProvider}
-              setReasoningProvider={setReasoningProvider}
-              cloudReasoningBaseUrl={cloudReasoningBaseUrl}
-              setCloudReasoningBaseUrl={setCloudReasoningBaseUrl}
-              openaiApiKey={openaiApiKey}
-              setOpenaiApiKey={setOpenaiApiKey}
-              anthropicApiKey={anthropicApiKey}
-              setAnthropicApiKey={setAnthropicApiKey}
-              geminiApiKey={geminiApiKey}
-              setGeminiApiKey={setGeminiApiKey}
-              groqApiKey={groqApiKey}
-              setGroqApiKey={setGroqApiKey}
-              customReasoningApiKey={customReasoningApiKey}
-              setCustomReasoningApiKey={setCustomReasoningApiKey}
-              toast={toast}
-            />
-
-            {/* Agent Config */}
-            <div className="border-t border-border/40 pt-6">
-              <SectionHeader
-                title={t("settingsPage.agentConfig.title")}
-                description={t("settingsPage.agentConfig.description")}
-              />
-
-              <div className="space-y-5">
-                <div>
-                  <p className="text-xs font-medium text-foreground mb-3">
-                    {t("settingsPage.agentConfig.agentName")}
-                  </p>
-                  <SettingsPanel>
-                    <SettingsPanelRow>
-                      <div className="space-y-3">
-                        <div className="flex gap-2">
-                          <Input
-                            placeholder={t("settingsPage.agentConfig.placeholder")}
-                            value={agentNameInput}
-                            onChange={(e) => setAgentNameInput(e.target.value)}
-                            className="flex-1 text-center text-base font-mono"
-                          />
-                          <Button
-                            onClick={handleSaveAgentName}
-                            disabled={!agentNameInput.trim()}
-                            size="sm"
-                          >
-                            {t("settingsPage.agentConfig.save")}
-                          </Button>
-                        </div>
-                        <p className="text-xs text-muted-foreground/60">
-                          {t("settingsPage.agentConfig.helper")}
-                        </p>
-                      </div>
-                    </SettingsPanelRow>
-                  </SettingsPanel>
-                </div>
-
-                <div>
-                  <SectionHeader title={t("settingsPage.agentConfig.howItWorksTitle")} />
-                  <SettingsPanel>
-                    <SettingsPanelRow>
-                      <p className="text-xs text-muted-foreground leading-relaxed">
-                        {t("settingsPage.agentConfig.howItWorksDescription", { agentName })}
-                      </p>
-                    </SettingsPanelRow>
-                  </SettingsPanel>
-                </div>
-
-                <div>
-                  <SectionHeader title={t("settingsPage.agentConfig.examplesTitle")} />
-                  <SettingsPanel>
-                    <SettingsPanelRow>
-                      <div className="space-y-2.5">
-                        {[
-                          {
-                            input: t("settingsPage.agentConfig.examples.formalEmail", {
-                              agentName,
-                            }),
-                            mode: t("settingsPage.agentConfig.instructionMode"),
-                          },
-                          {
-                            input: t("settingsPage.agentConfig.examples.professional", {
-                              agentName,
-                            }),
-                            mode: t("settingsPage.agentConfig.instructionMode"),
-                          },
-                          {
-                            input: t("settingsPage.agentConfig.examples.bulletPoints", {
-                              agentName,
-                            }),
-                            mode: t("settingsPage.agentConfig.instructionMode"),
-                          },
-                          {
-                            input: t("settingsPage.agentConfig.cleanupExample"),
-                            mode: t("settingsPage.agentConfig.cleanupMode"),
-                          },
-                        ].map((example, i) => (
-                          <div key={i} className="flex items-start gap-3">
-                            <span
-                              className={`shrink-0 mt-0.5 text-xs font-medium uppercase tracking-wider px-1.5 py-px rounded ${
-                                example.mode === t("settingsPage.agentConfig.instructionMode")
-                                  ? "bg-primary/10 text-primary dark:bg-primary/15"
-                                  : "bg-muted text-muted-foreground"
-                              }`}
-                            >
-                              {example.mode}
-                            </span>
-                            <p className="text-xs text-muted-foreground leading-relaxed">
-                              "{example.input}"
-                            </p>
-                          </div>
-                        ))}
-                      </div>
-                    </SettingsPanelRow>
-                  </SettingsPanel>
-                </div>
-              </div>
-            </div>
-
-            {/* System Prompt */}
-            <div className="border-t border-border/40 pt-6">
-              <SectionHeader
-                title={t("settingsPage.prompts.title")}
-                description={t("settingsPage.prompts.description")}
-              />
-              <PromptStudio />
-            </div>
-          </div>
-        );
+      case "speechToText":
+      case "llms":
+        return null;
 
       case "privacyData":
         return (
@@ -3183,18 +4153,34 @@ EOF`,
                     <SettingsPanelRow>
                       <SettingsRow
                         label={t("settingsPage.privacy.cloudBackup")}
-                        description={t("settingsPage.privacy.cloudBackupDescription")}
+                        description={
+                          cloudBackupPolicyAllowed
+                            ? t("settingsPage.privacy.cloudBackupDescription")
+                            : t("common.managedByOrg")
+                        }
                       >
                         <Toggle
                           checked={cloudBackupEnabled}
+                          disabled={
+                            !canChangeCloudBackupPreference(
+                              cloudBackupPolicyAllowed,
+                              cloudBackupEnabled
+                            )
+                          }
                           onChange={(v) => {
                             setCloudBackupEnabled(v);
-                            if (v) startMigration().catch(console.error);
+                            if (v) {
+                              startMigration().catch(console.error);
+                              syncService.requestSyncAll("manual");
+                            }
                           }}
                         />
                       </SettingsRow>
                     </SettingsPanelRow>
                   </SettingsPanel>
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    {t("settingsPage.privacy.cloudBackupTeamCaveat")}
+                  </p>
                   {migration && (
                     <div className="mt-2 space-y-1">
                       <div className="flex items-center justify-between text-xs text-muted-foreground">
@@ -3220,10 +4206,106 @@ EOF`,
                       {t("settingsPage.privacy.cloudNotesMigrationDone")}
                     </p>
                   )}
+                  {cloudBackupEnabled &&
+                    isSignedIn &&
+                    (() => {
+                      const lastSyncedAt = localStorage.getItem("lastSyncedAt");
+                      if (!lastSyncedAt) return null;
+                      const date = new Date(lastSyncedAt);
+                      const now = new Date();
+                      const diffMs = now.getTime() - date.getTime();
+                      const diffMin = Math.floor(diffMs / 60000);
+                      const diffHr = Math.floor(diffMs / 3600000);
+                      let relative: string;
+                      if (diffMin < 1) relative = t("settingsPage.privacy.justNow");
+                      else if (diffMin < 60)
+                        relative = t("settingsPage.privacy.minutesAgo", { count: diffMin });
+                      else if (diffHr < 24)
+                        relative = t("settingsPage.privacy.hoursAgo", { count: diffHr });
+                      else
+                        relative = date.toLocaleDateString(undefined, {
+                          month: "short",
+                          day: "numeric",
+                          hour: "2-digit",
+                          minute: "2-digit",
+                        });
+                      return (
+                        <p className="mt-1 text-xs text-muted-foreground">
+                          {t("settingsPage.privacy.lastSynced", { time: relative })}
+                        </p>
+                      );
+                    })()}
                 </div>
               )}
 
               <SettingsPanel>
+                <SettingsPanelRow>
+                  <SettingsRow
+                    label={t("settingsPage.privacy.insightsSync")}
+                    description={
+                      !isSignedIn
+                        ? t("settingsPage.privacy.insightsSyncRequiresAccount")
+                        : !insightsSyncAllowedByPolicy
+                          ? t("common.managedByOrg")
+                          : effectiveDataRetentionEnabled
+                            ? t("settingsPage.privacy.insightsSyncDescription")
+                            : t("settingsPage.privacy.insightsSyncRequiresHistory")
+                    }
+                  >
+                    {/* With history off nothing is counted anywhere: this
+                        device records no counter, and the cloud writes none
+                        either, because analyticsSyncEnabled withholds the
+                        localDate its analytics write requires. Turning this on
+                        could therefore only promise a sync that never happens —
+                        but an already-on toggle must stay switchable off. */}
+                    <Toggle
+                      checked={insightsSyncEnabled}
+                      disabled={
+                        !isSignedIn ||
+                        !canToggleInsightsSync ||
+                        (!effectiveDataRetentionEnabled && !insightsSyncEnabled)
+                      }
+                      onChange={(enabled) => {
+                        if (enabled) void enableInsightsSync();
+                        else disableInsightsSync();
+                      }}
+                    />
+                  </SettingsRow>
+                </SettingsPanelRow>
+                <SettingsPanelRow>
+                  <SettingsRow
+                    label={t("insights.leaderboard.title")}
+                    description={
+                      !isSignedIn
+                        ? t("settingsPage.privacy.leaderboardRequiresAccount")
+                        : leaderboardParticipationError === "read"
+                          ? t("insights.leaderboard.activationError")
+                          : leaderboardLeavePending
+                            ? t("insights.leaderboard.leavePending")
+                            : !insightsSyncAllowedByPolicy
+                              ? t("common.managedByOrg")
+                              : !effectiveDataRetentionEnabled
+                                ? t("settingsPage.privacy.leaderboardRequiresHistory")
+                                : t("settingsPage.privacy.leaderboardDescription")
+                    }
+                  >
+                    <Toggle
+                      checked={isSignedIn && leaderboardParticipationEnabled}
+                      disabled={
+                        !isSignedIn ||
+                        !leaderboardParticipationReady ||
+                        leaderboardPreferencePending ||
+                        leaderboardParticipationUpdating ||
+                        leaderboardParticipationError === "read" ||
+                        (!leaderboardParticipationEnabled &&
+                          (!effectiveDataRetentionEnabled ||
+                            !insightsSyncAllowedByPolicy ||
+                            (!insightsSyncEnabled && !canToggleInsightsSync)))
+                      }
+                      onChange={(enabled) => void updateLeaderboardParticipation(enabled)}
+                    />
+                  </SettingsRow>
+                </SettingsPanelRow>
                 <SettingsPanelRow>
                   <SettingsRow
                     label={t("settingsPage.privacy.usageAnalytics")}
@@ -3236,7 +4318,7 @@ EOF`,
             </div>
 
             {/* Audio Retention */}
-            <div className="border-t border-border/40 pt-6">
+            <div className="border-t border-border/70 pt-6">
               <SectionHeader
                 title={t("settingsPage.privacy.audioRetention")}
                 description={t("settingsPage.privacy.audioRetentionDescription")}
@@ -3249,26 +4331,32 @@ EOF`,
                     description={t("settingsPage.privacy.audioRetentionDescription")}
                   >
                     <select
-                      value={audioRetentionDays}
-                      onChange={(e) => setAudioRetentionDays(parseInt(e.target.value, 10))}
-                      className="h-7 rounded border border-border/70 bg-surface-1/80 px-2.5 text-xs font-medium text-foreground shadow-sm backdrop-blur-sm hover:border-border-hover hover:bg-surface-2/70 focus:outline-none focus:ring-2 focus:ring-ring/30 focus:ring-offset-1 transition-colors duration-200"
+                      value={enforcedAudioRetentionDays}
+                      onChange={(e) => {
+                        const days = parseInt(e.target.value, 10);
+                        if (audioRetentionCap !== null && days > audioRetentionCap) return;
+                        setAudioRetentionDays(days);
+                      }}
+                      className={RETENTION_SELECT_CLASS}
                     >
                       <option value={0}>{t("settingsPage.privacy.audioRetentionDisabled")}</option>
-                      <option value={7}>
-                        {t("settingsPage.privacy.audioRetentionDays", { count: 7 })}
-                      </option>
-                      <option value={14}>
-                        {t("settingsPage.privacy.audioRetentionDays", { count: 14 })}
-                      </option>
-                      <option value={30}>
-                        {t("settingsPage.privacy.audioRetentionDays", { count: 30 })}
-                      </option>
-                      <option value={60}>
-                        {t("settingsPage.privacy.audioRetentionDays", { count: 60 })}
-                      </option>
-                      <option value={90}>
-                        {t("settingsPage.privacy.audioRetentionDays", { count: 90 })}
-                      </option>
+                      {enforcedAudioRetentionDays > 0 &&
+                        !RETENTION_DAY_OPTIONS.includes(enforcedAudioRetentionDays) && (
+                          <option value={enforcedAudioRetentionDays}>
+                            {t("settingsPage.privacy.retentionDays", {
+                              count: enforcedAudioRetentionDays,
+                            })}
+                          </option>
+                        )}
+                      {RETENTION_DAY_OPTIONS.map((days) => (
+                        <option
+                          key={days}
+                          value={days}
+                          disabled={audioRetentionCap !== null && days > audioRetentionCap}
+                        >
+                          {t("settingsPage.privacy.retentionDays", { count: days })}
+                        </option>
+                      ))}
                     </select>
                   </SettingsRow>
                 </SettingsPanelRow>
@@ -3299,14 +4387,56 @@ EOF`,
             </div>
 
             {/* Data Retention */}
-            <div className="border-t border-border/40 pt-6">
+            <div className="border-t border-border/70 pt-6">
               <SettingsPanel>
                 <SettingsPanelRow>
                   <SettingsRow
                     label={t("settingsPage.privacy.dataRetention")}
-                    description={t("settingsPage.privacy.dataRetentionDescription")}
+                    description={
+                      historyLockedByPolicy
+                        ? t("common.managedByOrg")
+                        : t("settingsPage.privacy.dataRetentionDescription")
+                    }
                   >
-                    <Toggle checked={dataRetentionEnabled} onChange={setDataRetentionEnabled} />
+                    <Toggle
+                      checked={effectiveDataRetentionEnabled}
+                      disabled={historyLockedByPolicy}
+                      onChange={setDataRetentionEnabled}
+                    />
+                  </SettingsRow>
+                </SettingsPanelRow>
+                <SettingsPanelRow>
+                  <SettingsRow
+                    label={t("settingsPage.privacy.transcriptRetention")}
+                    description={t("settingsPage.privacy.transcriptRetentionDescription")}
+                  >
+                    <select
+                      value={transcriptRetentionDays}
+                      disabled={!effectiveDataRetentionEnabled}
+                      onChange={(e) => setTranscriptRetentionDays(parseInt(e.target.value, 10))}
+                      className={RETENTION_SELECT_CLASS}
+                    >
+                      <option value={0}>
+                        {t("settingsPage.privacy.transcriptRetentionForever")}
+                      </option>
+                      {RETENTION_DAY_OPTIONS.map((days) => (
+                        <option key={days} value={days}>
+                          {t("settingsPage.privacy.retentionDays", { count: days })}
+                        </option>
+                      ))}
+                    </select>
+                  </SettingsRow>
+                </SettingsPanelRow>
+                <SettingsPanelRow>
+                  <SettingsRow
+                    label={t("settingsPage.privacy.saveDiscarded")}
+                    description={t("settingsPage.privacy.saveDiscardedDescription")}
+                  >
+                    <Toggle
+                      checked={saveDiscardedTranscriptions}
+                      disabled={!effectiveDataRetentionEnabled || enforcedAudioRetentionDays === 0}
+                      onChange={setSaveDiscardedTranscriptions}
+                    />
                   </SettingsRow>
                 </SettingsPanelRow>
                 <SettingsPanelRow>
@@ -3329,7 +4459,7 @@ EOF`,
             </div>
 
             {/* Permissions */}
-            <div className="border-t border-border/40 pt-6">
+            <div className="border-t border-border/70 pt-6">
               <SectionHeader
                 title={t("settingsPage.permissions.title")}
                 description={t("settingsPage.permissions.description")}
@@ -3345,17 +4475,19 @@ EOF`,
                   buttonText={t("settingsPage.permissions.grantAccess")}
                 />
 
-                {platform === "darwin" && (
+                {(platform === "darwin" || canManageSystemAudioInApp(systemAudio)) && (
                   <>
-                    <PermissionCard
-                      icon={Shield}
-                      title={t("settingsPage.permissions.accessibilityTitle")}
-                      description={t("settingsPage.permissions.accessibilityDescription")}
-                      granted={permissionsHook.accessibilityPermissionGranted}
-                      onRequest={permissionsHook.requestAccessibilityPermission}
-                      buttonText={t("settingsPage.permissions.grantAccess")}
-                    />
-                    {systemAudio.mode === "native" && (
+                    {platform === "darwin" && (
+                      <PermissionCard
+                        icon={Shield}
+                        title={t("settingsPage.permissions.accessibilityTitle")}
+                        description={t("settingsPage.permissions.accessibilityDescription")}
+                        granted={permissionsHook.accessibilityPermissionGranted}
+                        onRequest={permissionsHook.requestAccessibilityPermission}
+                        buttonText={t("settingsPage.permissions.grantAccess")}
+                      />
+                    )}
+                    {canManageSystemAudioInApp(systemAudio) && (
                       <PermissionCard
                         icon={Monitor}
                         title={t("settingsPage.permissions.systemAudioTitle")}
@@ -3380,7 +4512,7 @@ EOF`,
 
               {platform === "linux" &&
                 permissionsHook.pasteToolsInfo &&
-                !permissionsHook.pasteToolsInfo.available && (
+                needsLinuxPasteToolGuidance(permissionsHook.pasteToolsInfo) && (
                   <PasteToolsInfo
                     pasteToolsInfo={permissionsHook.pasteToolsInfo}
                     isChecking={permissionsHook.isCheckingPasteTools}
@@ -3431,13 +4563,18 @@ EOF`,
                     description={
                       updateStatus.isDevelopment
                         ? t("settingsPage.general.updates.devMode")
-                        : isUpdateAvailable
-                          ? t("settingsPage.general.updates.newVersionAvailable")
-                          : t("settingsPage.general.updates.latestVersion")
+                        : !updateStatus.isSupported
+                          ? t("settingsPage.general.updates.managedByPackageManager")
+                          : isUpdateAvailable
+                            ? t("settingsPage.general.updates.newVersionAvailable")
+                            : t("settingsPage.general.updates.latestVersion")
                     }
                   >
                     <div className="flex items-center gap-2.5">
-                      <span className="text-xs tabular-nums text-muted-foreground font-mono">
+                      <span
+                        dir="ltr"
+                        className="text-xs tabular-nums text-muted-foreground font-mono"
+                      >
                         {currentVersion || t("settingsPage.general.updates.versionPlaceholder")}
                       </span>
                       {updateStatus.isDevelopment ? (
@@ -3457,6 +4594,17 @@ EOF`,
                   </SettingsRow>
                 </SettingsPanelRow>
 
+                {updateStatus.isSupported && (
+                  <SettingsPanelRow>
+                    <SettingsRow
+                      label={t("settingsPage.general.updates.automaticUpdates")}
+                      description={t("settingsPage.general.updates.automaticUpdatesDescription")}
+                    >
+                      <Toggle checked={autoUpdatesEnabled} onChange={setAutoUpdatesEnabled} />
+                    </SettingsRow>
+                  </SettingsPanelRow>
+                )}
+
                 <SettingsPanelRow>
                   <div className="space-y-2.5">
                     <Button
@@ -3471,16 +4619,27 @@ EOF`,
                               ),
                             });
                           }
-                        } catch {}
+                        } catch {
+                          showAlertDialog({
+                            title: t("settingsPage.general.updates.dialogs.checkFailed.title"),
+                            description: t(
+                              "settingsPage.general.updates.dialogs.checkFailed.description"
+                            ),
+                          });
+                        }
                       }}
-                      disabled={checkingForUpdates || updateStatus.isDevelopment}
+                      disabled={
+                        checkingForUpdates ||
+                        updateStatus.isDevelopment ||
+                        !updateStatus.isSupported
+                      }
                       variant="outline"
                       className="w-full"
                       size="sm"
                     >
                       <RefreshCw
                         size={13}
-                        className={`mr-1.5 ${checkingForUpdates ? "animate-spin" : ""}`}
+                        className={`me-1.5 ${checkingForUpdates ? "animate-spin" : ""}`}
                       />
                       {checkingForUpdates
                         ? t("settingsPage.general.updates.checking")
@@ -3511,7 +4670,7 @@ EOF`,
                         >
                           <Download
                             size={13}
-                            className={`mr-1.5 ${downloadingUpdate ? "animate-pulse" : ""}`}
+                            className={`me-1.5 ${downloadingUpdate ? "animate-pulse" : ""}`}
                           />
                           {downloadingUpdate
                             ? t("settingsPage.general.updates.downloading", {
@@ -3569,7 +4728,7 @@ EOF`,
                       >
                         <RefreshCw
                           size={14}
-                          className={`mr-2 ${installInitiated ? "animate-spin" : ""}`}
+                          className={`me-2 ${installInitiated ? "animate-spin" : ""}`}
                         />
                         {installInitiated
                           ? t("settingsPage.general.updates.restarting")
@@ -3579,14 +4738,17 @@ EOF`,
                   </div>
 
                   {updateInfo?.releaseNotes && (
-                    <div className="mt-4 pt-4 border-t border-border/30">
+                    <div className="mt-4 pt-4 border-t border-border/70">
                       <p className="text-xs font-medium text-muted-foreground uppercase tracking-wider mb-2">
-                        {t("settingsPage.general.updates.whatsNew", {
-                          version: updateInfo.version,
-                        })}
+                        <BidiInterpolatedText
+                          text={t("settingsPage.general.updates.whatsNew", {
+                            version: BIDI_VALUE_TOKEN,
+                          })}
+                          value={updateInfo.version}
+                        />
                       </p>
                       <div
-                        className="text-xs text-muted-foreground [&_ul]:list-disc [&_ul]:pl-4 [&_ul]:space-y-1 [&_ol]:list-decimal [&_ol]:pl-4 [&_ol]:space-y-1 [&_li]:pl-1 [&_p]:mb-2 [&_p:last-child]:mb-0 [&_a]:text-link [&_a]:underline"
+                        className="text-xs text-muted-foreground [&_ul]:list-disc [&_ul]:ps-4 [&_ul]:space-y-1 [&_ol]:list-decimal [&_ol]:ps-4 [&_ol]:space-y-1 [&_li]:ps-1 [&_p]:mb-2 [&_p:last-child]:mb-0 [&_a]:text-link [&_a]:underline"
                         dangerouslySetInnerHTML={{ __html: updateInfo.releaseNotes }}
                       />
                     </div>
@@ -3596,12 +4758,12 @@ EOF`,
             </div>
 
             {/* Developer Tools */}
-            <div className="border-t border-border/40 pt-6">
+            <div className="border-t border-border/70 pt-6">
               <DeveloperSection />
             </div>
 
             {/* Data Management */}
-            <div className="border-t border-border/40 pt-6">
+            <div className="border-t border-border/70 pt-6">
               <SectionHeader
                 title={t("settingsPage.developer.dataManagementTitle")}
                 description={t("settingsPage.developer.dataManagementDescription")}
@@ -3612,7 +4774,11 @@ EOF`,
                   <SettingsPanelRow>
                     <SettingsRow
                       label={t("settingsPage.developer.modelCache")}
-                      description={cachePathHint}
+                      description={
+                        <span dir="ltr" className="block break-all">
+                          {cachePathHint}
+                        </span>
+                      }
                     >
                       <div className="flex items-center gap-2">
                         <Button
@@ -3620,7 +4786,7 @@ EOF`,
                           size="sm"
                           onClick={() => window.electronAPI?.openWhisperModelsFolder?.()}
                         >
-                          <FolderOpen className="mr-1.5 h-3.5 w-3.5" />
+                          <FolderOpen className="me-1.5 h-3.5 w-3.5" />
                           {t("settingsPage.developer.open")}
                         </Button>
                         <Button
@@ -3691,9 +4857,6 @@ EOF`,
           </div>
         );
 
-      case "agentMode":
-        return <AgentModeSettings />;
-
       default:
         return null;
     }
@@ -3701,6 +4864,8 @@ EOF`,
 
   return (
     <>
+      {insightsOptInDialog}
+
       <ConfirmDialog
         open={confirmDialog.open}
         onOpenChange={(open) => !open && hideConfirmDialog()}
@@ -3712,6 +4877,42 @@ EOF`,
         cancelText={confirmDialog.cancelText}
       />
 
+      <ConfirmDialog
+        open={isDeleteAccountDialogOpen}
+        onOpenChange={(open) => {
+          setIsDeleteAccountDialogOpen(open);
+          if (!open) setEraseDeviceData(false);
+        }}
+        title={t("settingsPage.account.deleteAccount.title")}
+        description={t("settingsPage.account.deleteAccount.description")}
+        onConfirm={() => void confirmDeleteAccount()}
+        variant="destructive"
+        confirmText={t("settingsPage.account.deleteAccount.confirmText")}
+        confirmDisabled={isDeletingAccount}
+      >
+        <label className="flex cursor-pointer items-start gap-3 rounded-lg border border-border p-3">
+          <input
+            type="checkbox"
+            className="mt-1 h-4 w-4 rounded border-border accent-destructive"
+            checked={eraseDeviceData}
+            onChange={(event) => setEraseDeviceData(event.target.checked)}
+          />
+          <span className="space-y-1">
+            <span className="block text-sm font-medium">
+              {t("settingsPage.account.deleteAccount.eraseDeviceLabel")}
+            </span>
+            <span className="block text-xs text-muted-foreground">
+              {t("settingsPage.account.deleteAccount.eraseDeviceDescription")}
+            </span>
+            {eraseDeviceData && (
+              <span className="block text-xs font-medium text-destructive">
+                {t("settingsPage.account.deleteAccount.eraseDeviceWarning")}
+              </span>
+            )}
+          </span>
+        </label>
+      </ConfirmDialog>
+
       <AlertDialog
         open={alertDialog.open}
         onOpenChange={(open) => !open && hideAlertDialog()}
@@ -3720,6 +4921,101 @@ EOF`,
         onOk={() => {}}
       />
 
+      {/* Mounted on first visit and kept alive so model-download progress and IPC listeners survive section switches. */}
+      {hasMountedSpeechToText && (
+        <TabPanel active={activeSection === "speechToText"}>
+          <SpeechToTextTabs
+            initialTab={
+              activeSection === "speechToText"
+                ? (initialSubTab as SpeechTab | undefined)
+                : undefined
+            }
+            renderDictation={() => (
+              <div className="space-y-6">
+                <TranscriptionSection
+                  isSignedIn={isSignedIn ?? false}
+                  startOnboarding={startOnboarding}
+                  cloudTranscriptionMode={cloudTranscriptionMode}
+                  setCloudTranscriptionMode={setCloudTranscriptionMode}
+                  useLocalWhisper={useLocalWhisper}
+                  setUseLocalWhisper={setUseLocalWhisper}
+                  updateTranscriptionSettings={updateTranscriptionSettings}
+                  cloudTranscriptionProvider={cloudTranscriptionProvider}
+                  setCloudTranscriptionProvider={setCloudTranscriptionProvider}
+                  cloudTranscriptionModel={cloudTranscriptionModel}
+                  setCloudTranscriptionModel={setCloudTranscriptionModel}
+                  localTranscriptionProvider={localTranscriptionProvider}
+                  setLocalTranscriptionProvider={setLocalTranscriptionProvider}
+                  whisperModel={whisperModel}
+                  setWhisperModel={setWhisperModel}
+                  parakeetModel={parakeetModel}
+                  setParakeetModel={setParakeetModel}
+                  cohereModel={cohereModel}
+                  setCohereModel={setCohereModel}
+                  cloudTranscriptionBaseUrl={cloudTranscriptionBaseUrl}
+                  setCloudTranscriptionBaseUrl={setCloudTranscriptionBaseUrl}
+                  transcriptionMode={transcriptionMode}
+                  setTranscriptionMode={setTranscriptionMode}
+                  remoteTranscriptionUrl={remoteTranscriptionUrl}
+                  setRemoteTranscriptionUrl={setRemoteTranscriptionUrl}
+                  remoteTranscriptionModel={remoteTranscriptionModel}
+                  setRemoteTranscriptionModel={setRemoteTranscriptionModel}
+                  showTranscriptionPreview={showTranscriptionPreview}
+                  setShowTranscriptionPreview={setShowTranscriptionPreview}
+                  toast={toast}
+                />
+                {transcriptionMode === "local" &&
+                  localTranscriptionProvider === "whisper" &&
+                  renderWhisperVadSettings()}
+              </div>
+            )}
+            renderNoteRecording={() => (
+              <div className="space-y-6">
+                <MeetingTranscriptionPanel />
+                {transcriptionMode === "local" &&
+                  localTranscriptionProvider === "whisper" &&
+                  renderWhisperVadSettings()}
+              </div>
+            )}
+            renderUpload={() => (
+              <div className="space-y-6">
+                <UploadTranscriptionPanel />
+              </div>
+            )}
+          />
+        </TabPanel>
+      )}
+      {hasMountedLlms && (
+        <TabPanel active={activeSection === "llms"}>
+          <LlmsTabs
+            initialTab={
+              activeSection === "llms" ? (initialSubTab as LlmTab | undefined) : undefined
+            }
+            renderChatIntelligence={() => <ChatAgentSettings />}
+            renderDictationCleanup={() => (
+              <div className="space-y-6">
+                <AiModelsSection
+                  useCleanupModel={useCleanupModel}
+                  setUseCleanupModel={(value) => {
+                    updateCleanupSettings({ useCleanupModel: value });
+                  }}
+                  toast={toast}
+                />
+                <div className="border-t border-border/70 pt-6">
+                  <SectionHeader
+                    title={t("settingsPage.prompts.title")}
+                    description={t("settingsPage.prompts.description")}
+                  />
+                  <PromptStudio />
+                </div>
+              </div>
+            )}
+            renderDictationAgent={() => <DictationAgentSettings />}
+            renderDictationTranslation={() => <DictationTranslationSettings />}
+            renderNoteFormatting={() => <NoteFormattingSettings />}
+          />
+        </TabPanel>
+      )}
       {renderSectionContent()}
     </>
   );

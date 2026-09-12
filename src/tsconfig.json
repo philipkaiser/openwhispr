@@ -7,6 +7,7 @@
     "jsx": "react-jsx",
     "strict": false,
     "noEmit": true,
+    "allowImportingTsExtensions": true,
     "allowJs": true,
     "checkJs": false,
     "esModuleInterop": true,
@@ -16,8 +17,7 @@
     "isolatedModules": true,
     "paths": {
       "@/*": ["./*"]
-    },
-    "baseUrl": "."
+    }
   },
   "include": ["**/*.ts", "**/*.tsx", "**/*.js", "**/*.jsx"],
   "exclude": ["node_modules", "dist"]

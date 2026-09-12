@@ -39,12 +39,13 @@ function fetchJson(url, redirectCount = 0) {
 
     https
       .get(url, options, (res) => {
-        if (res.statusCode === 301 || res.statusCode === 302) {
-          const redirectUrl = res.headers.location;
-          if (!redirectUrl) {
+        if ([301, 302, 303, 307, 308].includes(res.statusCode)) {
+          const location = res.headers.location;
+          if (!location) {
             reject(new Error("Redirect without location header"));
             return;
           }
+          const redirectUrl = location.startsWith("/") ? new URL(location, url).href : location;
           fetchJson(redirectUrl, redirectCount + 1)
             .then(resolve)
             .catch(reject);
@@ -73,25 +74,30 @@ function fetchJson(url, redirectCount = 0) {
 }
 
 /**
- * Fetch the latest release from a GitHub repository.
+ * Fetch a release from a GitHub repository.
  * @param {string} repo - Repository in "owner/repo" format
  * @param {object} options - Options
- * @param {string} [options.tagPrefix] - Only match releases with this tag prefix (e.g., "windows-key-listener-v")
- * @param {boolean} [options.includePrerelease=false] - Include prerelease versions
+ * @param {string} [options.tag] - Exact tag to fetch (works for any release age, no pagination)
+ * @param {string} [options.tagPrefix] - Latest release whose tag starts with this prefix (searches the 50 most recent only)
+ * @param {boolean} [options.includePrerelease=false] - Include prereleases (tagPrefix only)
  * @returns {Promise<{tag: string, assets: Array<{name: string, url: string}>, url: string} | null>}
  */
 async function fetchLatestRelease(repo, options = {}) {
-  const { tagPrefix, includePrerelease = false } = options;
+  const { tag, tagPrefix, includePrerelease = false } = options;
 
   try {
-    // If no tag prefix, use the simple /latest endpoint
+    if (tag) {
+      const url = `https://api.github.com/repos/${repo}/releases/tags/${encodeURIComponent(tag)}`;
+      const release = await fetchJson(url);
+      return formatRelease(release);
+    }
+
     if (!tagPrefix) {
       const url = `https://api.github.com/repos/${repo}/releases/latest`;
       const release = await fetchJson(url);
       return formatRelease(release);
     }
 
-    // Otherwise, fetch all releases and filter by prefix
     const url = `https://api.github.com/repos/${repo}/releases?per_page=50`;
     const releases = await fetchJson(url);
 
@@ -156,13 +162,16 @@ function downloadFile(url, dest, retryCount = 0) {
       }
 
       activeRequest = https.get(currentUrl, (response) => {
-        if (response.statusCode === 302 || response.statusCode === 301) {
-          const redirectUrl = response.headers.location;
-          if (!redirectUrl) {
+        if ([301, 302, 303, 307, 308].includes(response.statusCode)) {
+          const location = response.headers.location;
+          if (!location) {
             cleanup();
             reject(new Error("Redirect without location header"));
             return;
           }
+          const redirectUrl = location.startsWith("/")
+            ? new URL(location, currentUrl).href
+            : location;
           request(redirectUrl, redirectCount + 1);
           return;
         }
@@ -310,10 +319,63 @@ function setExecutable(filePath) {
   }
 }
 
+function matchesPattern(filename, pattern) {
+  if (pattern === "*.dylib") {
+    return filename.endsWith(".dylib");
+  } else if (pattern === "*.dll") {
+    return filename.endsWith(".dll");
+  } else if (pattern === "*.so*") {
+    return /\.so(\.\d+)*$/.test(filename) || filename.endsWith(".so");
+  }
+  return false;
+}
+
+function findLibrariesInDir(dir, pattern, options = {}, currentDepth = 0) {
+  const { maxDepth = 5, ignoreReadErrors = false } = options;
+  if (currentDepth >= maxDepth) return [];
+
+  const results = [];
+  let entries;
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch (error) {
+    if (ignoreReadErrors) return [];
+    throw error;
+  }
+
+  for (const entry of entries) {
+    const fullPath = path.join(dir, entry.name);
+
+    if (entry.isDirectory()) {
+      results.push(...findLibrariesInDir(fullPath, pattern, options, currentDepth + 1));
+    } else if (matchesPattern(entry.name, pattern)) {
+      results.push(fullPath);
+    }
+  }
+
+  return results;
+}
+
+function copyLibraries(extractDir, destDir, pattern) {
+  const copied = [];
+  for (const libPath of findLibrariesInDir(extractDir, pattern)) {
+    const libName = path.basename(libPath);
+    const destPath = path.join(destDir, libName);
+    fs.copyFileSync(libPath, destPath);
+    setExecutable(destPath);
+    copied.push(libName);
+  }
+  return copied;
+}
+
 function cleanupFiles(binDir, prefix, keepPrefix) {
+  const keepPrefixes = Array.isArray(keepPrefix) ? keepPrefix : [keepPrefix];
+  // Never delete shared libraries; only platform binaries. The b9763 split ships
+  // llama-server-impl.dll, which shares the "llama-server" prefix and must survive.
+  const isLibrary = (f) => /\.(dll|dylib)$/i.test(f) || /\.so(\.\d+)*$/.test(f);
   const files = fs.readdirSync(binDir).filter((f) => f.startsWith(prefix));
   files.forEach((file) => {
-    if (!file.startsWith(keepPrefix)) {
+    if (!keepPrefixes.some((keep) => file.startsWith(keep)) && !isLibrary(file)) {
       const filePath = path.join(binDir, file);
       console.log(`Removing old binary: ${file}`);
       fs.unlinkSync(filePath);
@@ -322,11 +384,14 @@ function cleanupFiles(binDir, prefix, keepPrefix) {
 }
 
 module.exports = {
+  copyLibraries,
   downloadFile,
   extractArchive,
   extractZip,
   fetchLatestRelease,
   findBinaryInDir,
+  findLibrariesInDir,
+  matchesPattern,
   parseArgs,
   setExecutable,
   cleanupFiles,

@@ -2,6 +2,7 @@
 const fs = require("fs");
 const path = require("path");
 const {
+  copyLibraries,
   downloadFile,
   extractArchive,
   fetchLatestRelease,
@@ -11,10 +12,11 @@ const {
   cleanupFiles,
 } = require("./lib/download-utils");
 
-const LLAMA_CPP_REPO = "ggerganov/llama.cpp";
+const LLAMA_CPP_REPO = "ggml-org/llama.cpp";
 
-// Version can be pinned via environment variable for reproducible builds
-const VERSION_OVERRIDE = process.env.LLAMA_CPP_VERSION || null;
+// Pinned to a tested build that loads current GGUF models. whisper-server is
+// statically linked, so bumping this can't affect local Whisper.
+const LLAMA_CPP_TAG = process.env.LLAMA_CPP_VERSION || "b9763";
 
 const BINARIES = {
   "darwin-arm64": {
@@ -53,47 +55,12 @@ let cachedRelease = null;
 
 async function getRelease() {
   if (cachedRelease) return cachedRelease;
-
-  if (VERSION_OVERRIDE) {
-    cachedRelease = await fetchLatestRelease(LLAMA_CPP_REPO, { tagPrefix: VERSION_OVERRIDE });
-  } else {
-    cachedRelease = await fetchLatestRelease(LLAMA_CPP_REPO);
-  }
+  cachedRelease = await fetchLatestRelease(LLAMA_CPP_REPO, { tag: LLAMA_CPP_TAG });
   return cachedRelease;
 }
 
 function findAsset(release, pattern) {
   return release?.assets?.find((a) => pattern.test(a.name));
-}
-
-function findLibrariesInDir(dir, pattern, maxDepth = 5, currentDepth = 0) {
-  if (currentDepth >= maxDepth) return [];
-
-  const results = [];
-  const entries = fs.readdirSync(dir, { withFileTypes: true });
-
-  for (const entry of entries) {
-    const fullPath = path.join(dir, entry.name);
-
-    if (entry.isDirectory()) {
-      results.push(...findLibrariesInDir(fullPath, pattern, maxDepth, currentDepth + 1));
-    } else if (matchesPattern(entry.name, pattern)) {
-      results.push(fullPath);
-    }
-  }
-
-  return results;
-}
-
-function matchesPattern(filename, pattern) {
-  if (pattern === "*.dylib") {
-    return filename.endsWith(".dylib");
-  } else if (pattern === "*.dll") {
-    return filename.endsWith(".dll");
-  } else if (pattern === "*.so*") {
-    return /\.so(\.\d+)*$/.test(filename) || filename.endsWith(".so");
-  }
-  return false;
 }
 
 async function downloadBinary(key, config, release, isForce = false) {
@@ -139,14 +106,7 @@ async function downloadBinary(key, config, release, isForce = false) {
       console.log(`  ${key}: Extracted to ${config.outputName}`);
 
       if (config.libPattern) {
-        const libraries = findLibrariesInDir(extractDir, config.libPattern);
-
-        for (const libPath of libraries) {
-          const libName = path.basename(libPath);
-          const destPath = path.join(BIN_DIR, libName);
-
-          fs.copyFileSync(libPath, destPath);
-          setExecutable(destPath);
+        for (const libName of copyLibraries(extractDir, BIN_DIR, config.libPattern)) {
           console.log(`  ${key}: Copied library ${libName}`);
         }
       }
@@ -170,11 +130,7 @@ function getEntriesForPlatformArch(platformArch) {
 }
 
 async function main() {
-  if (VERSION_OVERRIDE) {
-    console.log(`\n[llama-server] Using pinned version: ${VERSION_OVERRIDE}`);
-  } else {
-    console.log("\n[llama-server] Fetching latest release...");
-  }
+  console.log(`\n[llama-server] Using pinned version: ${LLAMA_CPP_TAG}`);
   const release = await getRelease();
 
   if (!release) {

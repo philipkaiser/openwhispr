@@ -1,25 +1,25 @@
 const { autoUpdater } = require("electron-updater");
 
+// electron-updater can only replace an AppImage on Linux; deb, rpm and tar.gz
+// installs are updated by the package manager instead.
+const isUpdaterSupported = process.platform !== "linux" || Boolean(process.env.APPIMAGE);
+
 class UpdateManager {
   constructor() {
-    this.mainWindow = null;
-    this.controlPanelWindow = null;
     this.updateAvailable = false;
     this.updateDownloaded = false;
     this.lastUpdateInfo = null;
     this.isInstalling = false;
     this.isDownloading = false;
+    this.isQuittingForUpdate = false;
+    this.handleBeforeQuitForUpdate = null;
     this.eventListeners = [];
     this.updateCheckInterval = null;
     this.windowManager = null;
-    this._suppressNotification = false;
+    // null until the renderer syncs the preference, so nothing downloads unasked.
+    this.autoUpdatesEnabled = null;
 
     this.setupAutoUpdater();
-  }
-
-  setWindows(mainWindow, controlPanelWindow) {
-    this.mainWindow = mainWindow;
-    this.controlPanelWindow = controlPanelWindow;
   }
 
   setWindowManager(windowManager) {
@@ -91,16 +91,10 @@ class UpdateManager {
           };
         }
         this.notifyRenderers("update-available", info);
-        if (this.windowManager && info && !this._suppressNotification) {
-          this.windowManager.showUpdateNotification(info).catch((err) => {
-            console.error("Failed to show update notification:", err);
-          });
-        }
-        this._suppressNotification = false;
+        this._autoDownloadIfEnabled();
       },
       "update-not-available": (info) => {
         this.updateAvailable = false;
-        this._suppressNotification = false;
         if (!this.updateDownloaded) {
           this.isDownloading = false;
           this.lastUpdateInfo = null;
@@ -109,7 +103,6 @@ class UpdateManager {
       },
       error: (err) => {
         console.error("❌ Auto-updater error:", err);
-        this._suppressNotification = false;
         this.isDownloading = false;
         this.notifyRenderers("update-error", err);
       },
@@ -139,18 +132,27 @@ class UpdateManager {
       autoUpdater.on(event, handler);
       this.eventListeners.push({ event, handler });
     });
+
+    // electron-updater and Squirrel.Mac emit this on Electron's native
+    // autoUpdater (before any windows close), not on the electron-updater instance.
+    this.handleBeforeQuitForUpdate = () => {
+      this.isQuittingForUpdate = true;
+      if (this.windowManager) {
+        this.windowManager.isQuitting = true;
+        this.windowManager.hotkeyManager.unregisterAll();
+      }
+    };
+    require("electron").autoUpdater.on("before-quit-for-update", this.handleBeforeQuitForUpdate);
   }
 
   notifyRenderers(channel, data) {
-    if (this.mainWindow && !this.mainWindow.isDestroyed() && this.mainWindow.webContents) {
-      this.mainWindow.webContents.send(channel, data);
-    }
-    if (
-      this.controlPanelWindow &&
-      !this.controlPanelWindow.isDestroyed() &&
-      this.controlPanelWindow.webContents
-    ) {
-      this.controlPanelWindow.webContents.send(channel, data);
+    // Read window refs live from windowManager: cached refs go stale when the
+    // control panel is created after boot (start minimized) or recreated.
+    const { mainWindow, controlPanelWindow } = this.windowManager ?? {};
+    for (const win of [mainWindow, controlPanelWindow]) {
+      if (win && !win.isDestroyed() && win.webContents) {
+        win.webContents.send(channel, data);
+      }
     }
   }
 
@@ -163,8 +165,14 @@ class UpdateManager {
         };
       }
 
+      if (!isUpdaterSupported) {
+        return {
+          updateAvailable: false,
+          message: "Updates are installed through the system package manager",
+        };
+      }
+
       console.log("🔍 Checking for updates...");
-      this._suppressNotification = true;
       const result = await autoUpdater.checkForUpdates();
 
       if (result?.isUpdateAvailable && result?.updateInfo) {
@@ -251,15 +259,6 @@ class UpdateManager {
       this.isInstalling = true;
       console.log("🔄 Installing update and restarting...");
 
-      const { app, BrowserWindow } = require("electron");
-
-      // Set windowManager.isQuitting before removing close listeners
-      app.emit("before-quit");
-      app.removeAllListeners("window-all-closed");
-      BrowserWindow.getAllWindows().forEach((win) => {
-        win.removeAllListeners("close");
-      });
-
       const isSilent = process.platform === "win32";
       autoUpdater.quitAndInstall(isSilent, true);
 
@@ -287,6 +286,7 @@ class UpdateManager {
         updateAvailable: this.updateAvailable,
         updateDownloaded: this.updateDownloaded,
         isDevelopment: process.env.NODE_ENV === "development",
+        isSupported: isUpdaterSupported,
       };
     } catch (error) {
       console.error("❌ Error getting update status:", error);
@@ -303,21 +303,37 @@ class UpdateManager {
     }
   }
 
+  setAutoUpdatesEnabled(enabled) {
+    this.autoUpdatesEnabled = enabled;
+    // The startup check may have found an update before the renderer synced.
+    if (enabled) this._autoDownloadIfEnabled();
+  }
+
+  _autoDownloadIfEnabled() {
+    if (!this.autoUpdatesEnabled || !this.updateAvailable) return;
+    // downloadUpdate() is a no-op while a download is in flight or complete;
+    // failures surface through the shared "error" handler and the renderers.
+    this.downloadUpdate().catch(() => {});
+  }
+
+  // Checks always run so the sidebar can offer a manual download when automatic
+  // updates are off; a failed background check is logged and never surfaced.
+  _autoCheckForUpdates(label) {
+    console.log(`🔄 ${label} update check...`);
+    autoUpdater.checkForUpdates().catch((err) => {
+      console.error(`${label} update check failed:`, err);
+    });
+  }
+
   checkForUpdatesOnStartup() {
-    if (process.env.NODE_ENV !== "development") {
+    if (process.env.NODE_ENV !== "development" && isUpdaterSupported) {
       setTimeout(() => {
-        console.log("🔄 Checking for updates on startup...");
-        autoUpdater.checkForUpdates().catch((err) => {
-          console.error("Startup update check failed:", err);
-        });
+        this._autoCheckForUpdates("Startup");
       }, 3000);
 
       const FOUR_HOURS_MS = 4 * 60 * 60 * 1000;
       this.updateCheckInterval = setInterval(() => {
-        console.log("🔄 Periodic update check...");
-        autoUpdater.checkForUpdates().catch((err) => {
-          console.error("Periodic update check failed:", err);
-        });
+        this._autoCheckForUpdates("Periodic");
       }, FOUR_HOURS_MS);
     }
   }
@@ -331,6 +347,13 @@ class UpdateManager {
       autoUpdater.removeListener(event, handler);
     });
     this.eventListeners = [];
+    if (this.handleBeforeQuitForUpdate) {
+      require("electron").autoUpdater.removeListener(
+        "before-quit-for-update",
+        this.handleBeforeQuitForUpdate
+      );
+      this.handleBeforeQuitForUpdate = null;
+    }
   }
 }
 

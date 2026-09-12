@@ -1,8 +1,11 @@
 /**
- * WindowsKeyManager - Handles key up/down detection for Push-to-Talk on Windows
+ * WindowsKeyManager - Detects key up/down for global hotkeys on Windows
  *
- * Uses a native Windows keyboard hook to detect when specific keys are
- * pressed and released, enabling Push-to-Talk functionality.
+ * Modifier-only and right-side-modifier hotkeys can't register through Electron's
+ * globalShortcut, so each one is watched by a native low-level keyboard hook. One
+ * hook process is spawned per watched key; key-down/key-up events are emitted
+ * tagged with the key so the caller can route them to the right hotkey slot
+ * (dictation, voice assistant, translation, meeting) and drive push-to-talk.
  */
 
 const { spawn } = require("child_process");
@@ -14,48 +17,45 @@ const debugLogger = require("./debugLogger");
 class WindowsKeyManager extends EventEmitter {
   constructor() {
     super();
-    this.process = null;
     this.isSupported = process.platform === "win32";
     this.hasReportedError = false;
-    this.currentKey = null;
-    this.isReady = false;
+    this.hasReportedUnavailable = false;
+    this.listeners = new Map(); // key string -> child process
   }
 
   /**
-   * Start listening for the specified key
-   * @param {string} key - The key to listen for (e.g., "`", "F8", "F11", "CommandOrControl+F11")
+   * Reconcile the watched keys to exactly `keys`: spawn a listener for each new
+   * key, stop listeners no longer wanted. Idempotent — safe to call repeatedly.
    */
-  start(key = "`") {
-    if (!this.isSupported) {
-      return;
+  setKeys(keys) {
+    if (!this.isSupported) return;
+    const desired = new Set(keys.filter(Boolean));
+
+    for (const key of [...this.listeners.keys()]) {
+      if (!desired.has(key)) this._stopKey(key);
     }
 
-    // If already running with the same key, do nothing
-    if (this.process && this.currentKey === key) {
-      return;
-    }
-
-    // Stop any existing listener
-    this.stop();
+    if (desired.size === 0) return;
 
     const listenerPath = this.resolveListenerBinary();
     if (!listenerPath) {
       // Binary not found - this is OK, Push-to-Talk will use fallback mode
-      this.emit("unavailable", new Error("Windows key listener binary not found"));
+      if (!this.hasReportedUnavailable) {
+        this.hasReportedUnavailable = true;
+        this.emit("unavailable", new Error("Windows key listener binary not found"));
+      }
       return;
     }
 
-    this.hasReportedError = false;
-    this.isReady = false;
-    this.currentKey = key;
+    for (const key of desired) {
+      if (!this.listeners.has(key)) this._startKey(key, listenerPath);
+    }
+  }
 
-    debugLogger.debug("[WindowsKeyManager] Starting key listener", {
-      key,
-      binaryPath: listenerPath,
-    });
-
+  _startKey(key, listenerPath) {
+    let child;
     try {
-      this.process = spawn(listenerPath, [key], {
+      child = spawn(listenerPath, [key], {
         stdio: ["ignore", "pipe", "pipe"],
         windowsHide: true,
       });
@@ -65,52 +65,48 @@ class WindowsKeyManager extends EventEmitter {
       return;
     }
 
-    this.process.stdout.setEncoding("utf8");
-    this.process.stdout.on("data", (chunk) => {
-      chunk
-        .split(/\r?\n/)
-        .map((line) => line.trim())
-        .filter(Boolean)
-        .forEach((line) => {
-          if (line === "READY") {
-            debugLogger.debug("[WindowsKeyManager] Listener ready", { key });
-            this.isReady = true;
-            this.emit("ready");
-          } else if (line === "KEY_DOWN") {
-            debugLogger.debug("[WindowsKeyManager] KEY_DOWN detected", { key });
-            this.emit("key-down", key);
-          } else if (line === "KEY_UP") {
-            debugLogger.debug("[WindowsKeyManager] KEY_UP detected", { key });
-            this.emit("key-up", key);
-          } else {
-            // Log unknown output at debug level (could be native binary's stderr info)
-            debugLogger.debug("[WindowsKeyManager] Unknown output", { line });
-          }
-        });
+    this.hasReportedError = false;
+    this.listeners.set(key, child);
+    debugLogger.debug("[WindowsKeyManager] Starting key listener", {
+      key,
+      binaryPath: listenerPath,
     });
 
-    this.process.stderr.setEncoding("utf8");
-    this.process.stderr.on("data", (data) => {
+    let lineBuffer = "";
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      lineBuffer += chunk;
+      const lines = lineBuffer.split(/\r?\n/);
+      lineBuffer = lines.pop();
+      for (const raw of lines) {
+        const line = raw.trim();
+        if (line) this.handleOutputLine(line, key);
+      }
+    });
+
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (data) => {
       const message = data.toString().trim();
       if (message.length > 0) {
         // Native binary logs to stderr for info messages, don't treat as error
-        debugLogger.debug("[WindowsKeyManager] Native stderr", { message });
+        debugLogger.debug("[WindowsKeyManager] Native stderr", { key, message });
       }
     });
 
-    const proc = this.process;
-
-    proc.on("error", (error) => {
-      if (this.process === proc) this.process = null;
+    child.on("error", (error) => {
+      if (this.listeners.get(key) === child) this.listeners.delete(key);
       this.reportError(error);
     });
 
-    proc.on("exit", (code, signal) => {
-      if (this.process === proc) {
-        this.process = null;
-        this.isReady = false;
-      }
-      if (code !== 0) {
+    child.on("exit", (code, signal) => {
+      const trailingLine = lineBuffer.trim();
+      if (trailingLine) this.handleOutputLine(trailingLine, key);
+
+      // wasTracked is false for intentional stops (_stopKey deletes first), so this
+      // reports only unexpected exits — including signal crashes, where code is null.
+      const wasTracked = this.listeners.get(key) === child;
+      if (wasTracked) this.listeners.delete(key);
+      if (wasTracked && (code || signal)) {
         this.reportError(
           new Error(
             `Windows key listener exited with code ${code ?? "null"} signal ${signal ?? "null"}`
@@ -120,25 +116,49 @@ class WindowsKeyManager extends EventEmitter {
     });
   }
 
-  /**
-   * Stop the key listener
-   */
-  stop() {
-    if (this.process) {
-      debugLogger.debug("[WindowsKeyManager] Stopping key listener");
-      try {
-        this.process.kill();
-      } catch {
-        // Ignore kill errors
-      }
-      this.process = null;
+  _stopKey(key) {
+    const child = this.listeners.get(key);
+    if (!child) return;
+    this.listeners.delete(key);
+    debugLogger.debug("[WindowsKeyManager] Stopping key listener", { key });
+    try {
+      child.kill();
+    } catch {
+      // Already gone
     }
-    this.isReady = false;
-    this.currentKey = null;
+  }
+
+  handleOutputLine(line, key) {
+    if (line === "READY") {
+      debugLogger.debug("[WindowsKeyManager] Listener ready", { key });
+      this.emit("ready", key);
+      return;
+    }
+
+    if (line === "KEY_DOWN") {
+      debugLogger.debug("[WindowsKeyManager] KEY_DOWN detected", { key });
+      this.emit("key-down", key);
+      return;
+    }
+
+    if (line === "KEY_UP") {
+      debugLogger.debug("[WindowsKeyManager] KEY_UP detected", { key });
+      this.emit("key-up", key);
+      return;
+    }
+
+    debugLogger.debug("[WindowsKeyManager] Unknown output", { key, line });
   }
 
   /**
-   * Check if the listener is available and ready
+   * Stop all key listeners.
+   */
+  stop() {
+    for (const key of [...this.listeners.keys()]) this._stopKey(key);
+  }
+
+  /**
+   * Check if the listener binary is available
    */
   isAvailable() {
     return this.resolveListenerBinary() !== null;
@@ -148,21 +168,8 @@ class WindowsKeyManager extends EventEmitter {
    * Report an error (only once per session to avoid log spam)
    */
   reportError(error) {
-    if (this.hasReportedError) {
-      return;
-    }
+    if (this.hasReportedError) return;
     this.hasReportedError = true;
-
-    if (this.process) {
-      try {
-        this.process.kill();
-      } catch {
-        // Ignore
-      } finally {
-        this.process = null;
-      }
-    }
-
     debugLogger.warn("[WindowsKeyManager] Error occurred", { error: error.message });
     this.emit("error", error);
   }

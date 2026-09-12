@@ -28,6 +28,21 @@ function killProcess(proc, signal = "SIGTERM") {
   }
 }
 
+// Signals the whole process group on Unix so grandchildren get reaped too.
+// Windows' killProcess already passes /T, which covers the descendant tree.
+function killProcessGroup(proc, signal = "SIGTERM") {
+  if (!proc || proc.exitCode !== null) return;
+  if (process.platform === "win32") {
+    killProcess(proc, signal);
+    return;
+  }
+  try {
+    process.kill(-proc.pid, signal);
+  } catch {
+    killProcess(proc, signal);
+  }
+}
+
 // Timeout constants
 const TIMEOUTS = {
   QUICK_CHECK: 5000, // 5 seconds for quick checks
@@ -84,7 +99,7 @@ async function runCommand(cmd, args = [], options = {}) {
     let timer;
 
     try {
-      childProc = spawn(cmd, args, { shell });
+      childProc = spawn(cmd, args, { shell, windowsHide: true });
     } catch (error) {
       reject(error);
       return;
@@ -142,5 +157,6 @@ async function runCommand(cmd, args = [], options = {}) {
 module.exports = {
   runCommand,
   killProcess,
+  killProcessGroup,
   TIMEOUTS,
 };

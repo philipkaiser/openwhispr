@@ -5,11 +5,13 @@ const debugLogger = require("./debugLogger");
 const {
   downloadFile,
   createDownloadSignal,
+  createDownloadInProgressError,
   validateFileSize,
   cleanupStaleDownloads,
   checkDiskSpace,
 } = require("./downloadUtils");
 const WhisperServerManager = require("./whisperServer");
+const { createAbortError } = require("./abortError");
 const { getModelsDirForService } = require("./modelDirUtils");
 
 const modelRegistryData = require("../models/modelRegistryData.json");
@@ -30,6 +32,29 @@ function getValidModelNames() {
   return Object.keys(modelRegistryData.whisperModels);
 }
 
+// WHISPER_GPU_FAILED holds a comma-separated list of backends that fell back
+// to CPU on this machine (e.g. "cuda" or "cuda,vulkan")
+function resolveFailedGpuBackends(value) {
+  return String(value || "")
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+}
+
+function shouldRewarmOnWake({
+  isRemote,
+  useCuda,
+  useVulkan,
+  modelName,
+  transcribing,
+  rewarmInFlight,
+}) {
+  // Only re-warm a running local GPU whisper-server: sleep evicts its model from
+  // VRAM. Skip remote/CPU servers, and skip while a transcription (already warming
+  // the server) or another re-warm is in flight. See #766.
+  return !isRemote && !!(useCuda || useVulkan) && !!modelName && !transcribing && !rewarmInFlight;
+}
+
 class WhisperManager {
   constructor() {
     this.cachedFFmpegPath = null;
@@ -39,6 +64,54 @@ class WhisperManager {
     // Server manager for HTTP-based transcription
     this.serverManager = new WhisperServerManager();
     this.currentServerModel = null;
+    this.cachedVadModelPath = undefined;
+    this._transcribing = false;
+    this._rewarmInFlight = false;
+    this._cudaBinaryManager = null;
+    this._vulkanBinaryManager = null;
+  }
+
+  setGpuBinaryManagers({ cuda, vulkan }) {
+    this._cudaBinaryManager = cuda || null;
+    this._vulkanBinaryManager = vulkan || null;
+  }
+
+  // The GPU backend for every server start is resolved fresh from the current
+  // env + installed packs, so enabling or removing a pack applies immediately
+  // instead of after an app restart. A pack on disk implies intent: the user
+  // downloaded it, so it engages unless WHISPER_*_ENABLED is explicitly set to
+  // "false" (case-insensitive; an opt-out that survives without deleting the
+  // pack). Requiring the flag to be present stranded downloaded packs on
+  // silent CPU whenever the .env line was lost (#1340). WHISPER_GPU_FAILED
+  // lists backends that crashed on this machine (persisted by ipcHandlers
+  // when the server falls back to CPU); they stay off until the user retries
+  // or re-downloads, so a doomed backend isn't re-attempted — and its model
+  // reload re-paid — on every launch.
+  resolveGpuStartOptions() {
+    const failed = resolveFailedGpuBackends(process.env.WHISPER_GPU_FAILED);
+    const useCuda =
+      (process.env.WHISPER_CUDA_ENABLED || "").toLowerCase() !== "false" &&
+      !failed.includes("cuda") &&
+      !!this._cudaBinaryManager?.isDownloaded();
+    const useVulkan =
+      !useCuda &&
+      (process.env.WHISPER_VULKAN_ENABLED || "").toLowerCase() !== "false" &&
+      !failed.includes("vulkan") &&
+      !!this._vulkanBinaryManager?.isDownloaded();
+    return { useCuda, useVulkan };
+  }
+
+  // Re-resolve GPU options and reload the server in place. Used after a GPU
+  // pack download, delete, or failure-retry so the change takes effect without
+  // an app restart. Callers that had to stop the server before touching pack
+  // files pass the model they captured first; no-op when none was loaded.
+  async restartServerWithGpuPreference(modelName = this.currentServerModel) {
+    if (!modelName || this.serverManager.isRemote) return { success: true, restarted: false };
+
+    const options = { ...this.serverManager.lastStartOptions, ...this.resolveGpuStartOptions() };
+    await this.stopServer();
+    const result = await this.startServer(modelName, options);
+    return { ...result, restarted: true };
   }
 
   getModelsDir() {
@@ -60,6 +133,26 @@ class WhisperManager {
     return path.join(this.getModelsDir(), config.fileName);
   }
 
+  isModelDownloaded(modelName) {
+    return fs.existsSync(this.getModelPath(modelName));
+  }
+
+  getVadModelPath() {
+    if (this.cachedVadModelPath !== undefined) return this.cachedVadModelPath;
+
+    const fileName = "ggml-silero-v5.1.2.bin";
+    const candidates = [];
+
+    if (process.resourcesPath) {
+      candidates.push(path.join(process.resourcesPath, "bin", "whisper-vad", fileName));
+    }
+    candidates.push(path.join(__dirname, "..", "..", "resources", "bin", "whisper-vad", fileName));
+
+    const resolved = candidates.find((p) => fs.existsSync(p)) || null;
+    this.cachedVadModelPath = resolved;
+    return resolved;
+  }
+
   async initializeAtStartup(settings = {}) {
     const startTime = Date.now();
 
@@ -69,7 +162,8 @@ class WhisperManager {
       await cleanupStaleDownloads(this.getModelsDir());
 
       // Pre-warm whisper-server if local mode enabled (eliminates 2-5s cold-start delay)
-      const { localTranscriptionProvider, whisperModel, useCuda } = settings;
+      const { localTranscriptionProvider, whisperModel } = settings;
+      const { useCuda, useVulkan } = this.resolveGpuStartOptions();
 
       if (
         localTranscriptionProvider === "whisper" &&
@@ -82,12 +176,13 @@ class WhisperManager {
           debugLogger.info("Pre-warming whisper-server", {
             model: whisperModel,
             modelPath,
-            cuda: !!useCuda,
+            cuda: useCuda,
+            vulkan: useVulkan,
           });
 
           try {
             const serverStartTime = Date.now();
-            await this.serverManager.start(modelPath, { useCuda: !!useCuda });
+            await this.serverManager.start(modelPath, { useCuda, useVulkan });
             this.currentServerModel = whisperModel;
 
             debugLogger.info("whisper-server pre-warmed successfully", {
@@ -218,6 +313,43 @@ class WhisperManager {
     this.currentServerModel = null;
   }
 
+  async onWakeFromSleep() {
+    const sm = this.serverManager;
+    const modelName = this.currentServerModel;
+    if (
+      !shouldRewarmOnWake({
+        isRemote: sm.isRemote,
+        useCuda: sm.useCuda,
+        useVulkan: sm.useVulkan,
+        modelName,
+        transcribing: this._transcribing,
+        rewarmInFlight: this._rewarmInFlight,
+      })
+    ) {
+      return false;
+    }
+
+    // Replay the last start options (VAD, threads) so the reloaded server
+    // matches the signature the next dictation will use; a bare start would
+    // otherwise be rejected by start()'s no-op guard and reload the model on
+    // the first dictation. See #766. GPU flags are re-resolved so a backend
+    // that failed since is not re-attempted.
+    const options = { ...sm.lastStartOptions, ...this.resolveGpuStartOptions() };
+    this._rewarmInFlight = true;
+    try {
+      debugLogger.info("Re-warming whisper-server after wake from sleep", { model: modelName });
+      await this.stopServer();
+      const result = await this.startServer(modelName, options);
+      if (!result?.success) {
+        debugLogger.warn("whisper-server wake re-warm failed", { reason: result?.reason });
+        return false;
+      }
+      return true;
+    } finally {
+      this._rewarmInFlight = false;
+    }
+  }
+
   getServerStatus() {
     return this.serverManager.getStatus();
   }
@@ -254,26 +386,54 @@ class WhisperManager {
     const model = options.model || "base";
     const language = options.language || null;
     const initialPrompt = options.initialPrompt || null;
+    const vadEnabled = options.vadEnabled === true;
+    const vadConfig = options.vadConfig || null;
     const modelPath = this.getModelPath(model);
 
-    // Check if model exists
     if (!fs.existsSync(modelPath)) {
       throw new Error(`Whisper model "${model}" not downloaded. Please download it from Settings.`);
     }
 
-    return await this.transcribeViaServer(audioBlob, model, language, initialPrompt);
+    return await this.transcribeViaServer(audioBlob, model, language, initialPrompt, {
+      vadEnabled,
+      vadConfig,
+      signal: options.signal,
+      skipDecoderThresholds: options.skipDecoderThresholds === true,
+    });
   }
 
-  async transcribeViaServer(audioBlob, model, language, initialPrompt = null) {
+  async transcribeViaServer(audioBlob, model, language, initialPrompt = null, options = {}) {
+    // Mark the server busy so a wake re-warm doesn't kill an in-flight dictation. See #766.
+    this._transcribing = true;
+    try {
+      return await this._runServerTranscription(audioBlob, model, language, initialPrompt, options);
+    } finally {
+      this._transcribing = false;
+    }
+  }
+
+  async _runServerTranscription(audioBlob, model, language, initialPrompt = null, options = {}) {
+    // An already-cancelled upload skips the server boot entirely.
+    if (options.signal?.aborted) {
+      throw createAbortError("whisper-server transcription cancelled");
+    }
+
     debugLogger.info("Transcription mode: SERVER", { model, language: language || "auto" });
     const modelPath = this.getModelPath(model);
 
-    // Start server if not running or if model changed
-    if (!this.serverManager.ready || this.currentServerModel !== model) {
-      debugLogger.debug("Starting/restarting whisper-server for model", { model });
-      await this.serverManager.start(modelPath, { useCuda: this.serverManager.useCuda });
-      this.currentServerModel = model;
+    const vadEnabled = options.vadEnabled === true;
+    const vadModelPath = vadEnabled ? this.getVadModelPath() : null;
+    if (vadEnabled && !vadModelPath) {
+      debugLogger.warn("VAD requested but ggml-silero model not found; running without VAD");
     }
+
+    await this.serverManager.start(modelPath, {
+      ...this.resolveGpuStartOptions(),
+      vadEnabled,
+      vadModelPath,
+      vadConfig: options.vadConfig || null,
+    });
+    this.currentServerModel = model;
 
     // Convert audioBlob to Buffer if needed
     let audioBuffer;
@@ -303,10 +463,60 @@ class WhisperManager {
     });
 
     const startTime = Date.now();
-    const result = await this.serverManager.transcribe(audioBuffer, { language, initialPrompt });
+    const result = await this.serverManager.transcribe(audioBuffer, {
+      language,
+      initialPrompt,
+      signal: options.signal,
+      skipDecoderThresholds: options.skipDecoderThresholds,
+    });
     const elapsed = Date.now() - startTime;
 
     debugLogger.logWhisperPipeline("transcribeViaServer - completed", {
+      elapsed,
+      resultKeys: Object.keys(result),
+    });
+
+    return this.parseWhisperResult(result);
+  }
+
+  async transcribeViaLan(audioBlob, url, options = {}) {
+    debugLogger.info("Transcription mode: LAN", { url, language: options.language || "auto" });
+
+    await this.serverManager.connectRemote(url);
+
+    let audioBuffer;
+    if (Buffer.isBuffer(audioBlob)) {
+      audioBuffer = audioBlob;
+    } else if (ArrayBuffer.isView(audioBlob)) {
+      audioBuffer = Buffer.from(audioBlob.buffer, audioBlob.byteOffset, audioBlob.byteLength);
+    } else if (audioBlob instanceof ArrayBuffer) {
+      audioBuffer = Buffer.from(audioBlob);
+    } else if (typeof audioBlob === "string") {
+      audioBuffer = Buffer.from(audioBlob, "base64");
+    } else if (audioBlob && audioBlob.buffer && typeof audioBlob.byteLength === "number") {
+      audioBuffer = Buffer.from(audioBlob.buffer, audioBlob.byteOffset || 0, audioBlob.byteLength);
+    } else {
+      throw new Error(`Unsupported audio data type: ${typeof audioBlob}`);
+    }
+
+    if (!audioBuffer || audioBuffer.length === 0) {
+      throw new Error("Audio buffer is empty - no audio data received");
+    }
+
+    debugLogger.logWhisperPipeline("transcribeViaLan - sending to server", {
+      bufferSize: audioBuffer.length,
+      url,
+      language: options.language,
+    });
+
+    const startTime = Date.now();
+    const result = await this.serverManager.transcribe(audioBuffer, {
+      language: options.language || null,
+      initialPrompt: options.initialPrompt || null,
+    });
+    const elapsed = Date.now() - startTime;
+
+    debugLogger.logWhisperPipeline("transcribeViaLan - completed", {
       elapsed,
       resultKeys: Object.keys(result),
     });
@@ -360,7 +570,17 @@ class WhisperManager {
       return { success: true, text };
     }
 
-    return { success: false, message: "No audio detected" };
+    // A response with neither shape is a broken backend, not silence. Reporting it
+    // as "No audio detected" sends users chasing their microphone when the engine
+    // is at fault, so surface it as the transcription failure it is.
+    const serverError = typeof result.error === "string" && result.error.trim();
+    return {
+      success: false,
+      error: "invalid_response",
+      message: serverError
+        ? `Transcription engine error: ${serverError}`
+        : "Transcription engine returned an unexpected response",
+    };
   }
 
   // Check if text is a whisper.cpp blank audio marker
@@ -377,8 +597,6 @@ class WhisperManager {
     const modelPath = this.getModelPath(modelName);
     const modelsDir = this.getModelsDir();
 
-    await fsPromises.mkdir(modelsDir, { recursive: true });
-
     if (fs.existsSync(modelPath)) {
       const stats = await fsPromises.stat(modelPath);
       return {
@@ -391,23 +609,41 @@ class WhisperManager {
       };
     }
 
-    const spaceCheck = await checkDiskSpace(modelsDir, modelConfig.size * 1.2);
-    if (!spaceCheck.ok) {
-      throw new Error(
-        `Not enough disk space to download model. Need ~${Math.round((modelConfig.size * 1.2) / 1_000_000)}MB, ` +
-          `only ${Math.round(spaceCheck.availableBytes / 1_000_000)}MB available.`
-      );
+    if (this.currentDownloadProcess) {
+      throw createDownloadInProgressError(modelName, this.currentDownloadProcess.model);
     }
 
     const { signal, abort } = createDownloadSignal();
-    this.currentDownloadProcess = { abort };
+    const downloadProcess = {
+      abort,
+      model: modelName,
+      phase: "progress",
+      percentage: 0,
+      downloadedBytes: 0,
+      totalBytes: 0,
+    };
+    this.currentDownloadProcess = downloadProcess;
 
     try {
+      await fsPromises.mkdir(modelsDir, { recursive: true });
+
+      const spaceCheck = await checkDiskSpace(modelsDir, modelConfig.size * 1.2);
+      if (!spaceCheck.ok) {
+        throw new Error(
+          `Not enough disk space to download model. Need ~${Math.round((modelConfig.size * 1.2) / 1_000_000)}MB, ` +
+            `only ${Math.round(spaceCheck.availableBytes / 1_000_000)}MB available.`
+        );
+      }
+
       await downloadFile(modelConfig.url, modelPath, {
         timeout: 600000,
         signal,
         expectedSize: modelConfig.size,
         onProgress: (downloadedBytes, totalBytes) => {
+          downloadProcess.percentage =
+            totalBytes > 0 ? Math.round((downloadedBytes / totalBytes) * 100) : 0;
+          downloadProcess.downloadedBytes = downloadedBytes;
+          downloadProcess.totalBytes = totalBytes;
           if (progressCallback) {
             progressCallback({
               type: "progress",
@@ -438,18 +674,21 @@ class WhisperManager {
       };
     } catch (error) {
       if (error.isAbort) {
-        throw new Error("Download interrupted by user");
+        throw Object.assign(new Error("Download interrupted by user"), {
+          code: "DOWNLOAD_CANCELLED",
+        });
       }
       throw error;
     } finally {
-      this.currentDownloadProcess = null;
+      if (this.currentDownloadProcess === downloadProcess) {
+        this.currentDownloadProcess = null;
+      }
     }
   }
 
   async cancelDownload() {
     if (this.currentDownloadProcess) {
       this.currentDownloadProcess.abort();
-      this.currentDownloadProcess = null;
       return { success: true, message: "Download cancelled" };
     }
     return { success: false, error: "No active download to cancel" };
@@ -457,6 +696,14 @@ class WhisperManager {
 
   async checkModelStatus(modelName) {
     const modelPath = this.getModelPath(modelName);
+    const activeDownload = this.currentDownloadProcess?.model === modelName;
+    const downloadStatus = {
+      isDownloading: activeDownload,
+      isInstalling: false,
+      downloadProgress: activeDownload ? this.currentDownloadProcess.percentage : 0,
+      downloadedBytes: activeDownload ? this.currentDownloadProcess.downloadedBytes : 0,
+      totalBytes: activeDownload ? this.currentDownloadProcess.totalBytes : 0,
+    };
 
     if (fs.existsSync(modelPath)) {
       const stats = await fsPromises.stat(modelPath);
@@ -467,10 +714,11 @@ class WhisperManager {
         size_bytes: stats.size,
         size_mb: Math.round(stats.size / (1024 * 1024)),
         success: true,
+        ...downloadStatus,
       };
     }
 
-    return { model: modelName, downloaded: false, success: true };
+    return { model: modelName, downloaded: false, success: true, ...downloadStatus };
   }
 
   async listWhisperModels() {
@@ -697,3 +945,5 @@ class WhisperManager {
 }
 
 module.exports = WhisperManager;
+module.exports.shouldRewarmOnWake = shouldRewarmOnWake;
+module.exports.resolveFailedGpuBackends = resolveFailedGpuBackends;

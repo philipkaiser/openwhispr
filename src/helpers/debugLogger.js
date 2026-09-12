@@ -31,6 +31,8 @@ const readArgLogLevel = () => {
   return null;
 };
 
+const hasConsoleLogOptIn = () => (process.argv || []).includes("--console-logs");
+
 class DebugLogger {
   constructor() {
     this.logLevel = this.resolveLogLevel();
@@ -40,6 +42,7 @@ class DebugLogger {
     this.logStream = null;
     this.fileLoggingEnabled = false;
     this.fileLoggingPending = this.debugMode; // Track if we need to initialize file logging later
+    this.consoleLoggingEnabled = this.resolveConsoleLogging();
 
     // IMPORTANT: Do NOT call initializeFileLogging() here!
     // It uses app.getPath() which is unsafe before app.whenReady().
@@ -71,6 +74,7 @@ class DebugLogger {
 
       this.debug("Debug logging enabled", { logFile: this.logFile });
       this.info("System Info", {
+        appVersion: app.getVersion(),
         platform: process.platform,
         nodeVersion: process.version,
         electronVersion: process.versions.electron,
@@ -110,6 +114,11 @@ class DebugLogger {
     return "info";
   }
 
+  resolveConsoleLogging() {
+    // Packaged Windows apps can inherit the launching shell's standard handles.
+    return process.platform !== "win32" || !app.isPackaged || hasConsoleLogOptIn();
+  }
+
   refreshLogLevel() {
     const nextLevel = this.resolveLogLevel();
     if (nextLevel === this.logLevel) return;
@@ -136,13 +145,26 @@ class DebugLogger {
     return LOG_LEVELS[normalized] >= this.levelValue;
   }
 
+  serializeValue(value) {
+    if (value instanceof Error) {
+      return {
+        name: value.name,
+        message: value.message,
+        ...(value.code ? { code: value.code } : {}),
+        ...(value.stack ? { stack: value.stack } : {}),
+        ...value,
+      };
+    }
+    return value;
+  }
+
   formatArgs(args) {
     return args
       .map((arg) => {
-        if (typeof arg === "object") {
+        if (arg !== null && typeof arg === "object") {
           try {
-            return JSON.stringify(arg, null, 2);
-          } catch (error) {
+            return JSON.stringify(this.serializeValue(arg), null, 2);
+          } catch {
             return String(arg);
           }
         }
@@ -155,8 +177,8 @@ class DebugLogger {
     if (meta === undefined) return "";
     if (typeof meta === "string") return meta;
     try {
-      return JSON.stringify(meta, null, 2);
-    } catch (error) {
+      return JSON.stringify(this.serializeValue(meta), null, 2);
+    } catch {
       return String(meta);
     }
   }
@@ -178,17 +200,20 @@ class DebugLogger {
     const metaText = this.formatMeta(meta);
     const logLine = metaText ? `${baseLine} ${metaText}\n` : `${baseLine}\n`;
 
-    const consoleFn =
-      normalized === "error" || normalized === "fatal"
-        ? console.error
-        : normalized === "warn"
-          ? console.warn
-          : console.log;
+    if (this.consoleLoggingEnabled) {
+      const consoleFn =
+        normalized === "error" || normalized === "fatal"
+          ? console.error
+          : normalized === "warn"
+            ? console.warn
+            : console.log;
 
-    if (meta !== undefined) {
-      consoleFn(`${levelTag}${scopeTag}${sourceTag} ${message}`, meta);
-    } else {
-      consoleFn(`${levelTag}${scopeTag}${sourceTag} ${message}`);
+      if (meta !== undefined) {
+        // Pass the prefix as a %s arg, not as a format string. See CodeQL js/tainted-format-string.
+        consoleFn("%s", `${levelTag}${scopeTag}${sourceTag} ${message}`, meta);
+      } else {
+        consoleFn(`${levelTag}${scopeTag}${sourceTag} ${message}`);
+      }
     }
 
     if (this.logStream) {

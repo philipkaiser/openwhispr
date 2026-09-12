@@ -27,6 +27,10 @@ export interface UsePermissionsProps {
   showAlertDialog: (dialog: { title: string; description?: string }) => void;
 }
 
+interface UsePermissionsOptions {
+  macAccessibilityChecksEnabled?: boolean;
+}
+
 const stopTracks = (stream?: MediaStream) => {
   try {
     stream?.getTracks?.().forEach((track) => track.stop());
@@ -103,25 +107,18 @@ const describeMicError = (error: unknown, t: TFunction): string => {
 };
 
 export const usePermissions = (
-  showAlertDialog?: UsePermissionsProps["showAlertDialog"]
+  showAlertDialog?: UsePermissionsProps["showAlertDialog"],
+  { macAccessibilityChecksEnabled = true }: UsePermissionsOptions = {}
 ): UsePermissionsReturn => {
   const { t } = useTranslation();
   const [micPermissionGranted, setMicPermissionGranted] = useLocalStorage(
     "micPermissionGranted",
-    false,
-    {
-      serialize: String,
-      deserialize: (value) => value === "true",
-    }
+    false
   );
   const [micPermissionError, setMicPermissionError] = useState<string | null>(null);
   const [accessibilityPermissionGranted, setAccessibilityPermissionGranted] = useLocalStorage(
     "accessibilityPermissionGranted",
-    false,
-    {
-      serialize: String,
-      deserialize: (value) => value === "true",
-    }
+    false
   );
   const [pasteToolsInfo, setPasteToolsInfo] = useState<PasteToolsResult | null>(null);
   const [isCheckingPasteTools, setIsCheckingPasteTools] = useState(false);
@@ -213,7 +210,7 @@ export const usePermissions = (
         alert(message);
       }
     }
-  }, [showAlertDialog, t]);
+  }, [showAlertDialog, t, setMicPermissionGranted]);
 
   const checkPasteToolsAvailability = useCallback(async (): Promise<PasteToolsResult | null> => {
     setIsCheckingPasteTools(true);
@@ -250,18 +247,8 @@ export const usePermissions = (
         return;
       }
 
-      // Trigger the macOS TCC prompt (creates entry in System Settings)
-      try {
-        const granted = await window.electronAPI?.promptAccessibilityPermission?.();
-        if (granted) {
-          setAccessibilityPermissionGranted(true);
-          return;
-        }
-      } catch {
-        // Falls through to opening System Settings
-      }
-
-      // Open System Settings for manual toggle
+      // Open System Settings directly — avoids the undismissable macOS TCC dialog
+      // that isTrustedAccessibilityClient(true) would show.
       await openSystemSettings("accessibility", window.electronAPI?.openAccessibilitySettings);
       return;
     }
@@ -293,18 +280,18 @@ export const usePermissions = (
     });
   }, [setMicPermissionGranted]);
 
-  // On macOS, re-validate accessibility permission on mount to override stale
-  // localStorage values (e.g. after app update changes the code signature).
+  // On macOS, re-validate accessibility permission once this screen is allowed
+  // to touch protected features, overriding stale localStorage values.
   useEffect(() => {
-    if (getPlatform() !== "darwin") return;
+    if (getPlatform() !== "darwin" || !macAccessibilityChecksEnabled) return;
     window.electronAPI?.checkAccessibilityPermission?.(true).then((granted) => {
       setAccessibilityPermissionGranted(granted);
     });
-  }, [setAccessibilityPermissionGranted]);
+  }, [macAccessibilityChecksEnabled, setAccessibilityPermissionGranted]);
 
   // Poll for accessibility permission changes on macOS (e.g. user grants in System Settings)
   useEffect(() => {
-    if (getPlatform() !== "darwin") return;
+    if (getPlatform() !== "darwin" || !macAccessibilityChecksEnabled) return;
     if (accessibilityPermissionGranted) {
       setAccessibilityTroubleshooting(false);
       accessibilityPollCount.current = 0;
@@ -328,7 +315,11 @@ export const usePermissions = (
     }, 2000);
 
     return () => clearInterval(interval);
-  }, [accessibilityPermissionGranted, setAccessibilityPermissionGranted]);
+  }, [
+    accessibilityPermissionGranted,
+    macAccessibilityChecksEnabled,
+    setAccessibilityPermissionGranted,
+  ]);
 
   return {
     micPermissionGranted,

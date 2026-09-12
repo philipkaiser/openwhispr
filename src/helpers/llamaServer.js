@@ -1,21 +1,72 @@
 const { spawn } = require("child_process");
 const fs = require("fs");
-const net = require("net");
 const path = require("path");
 const http = require("http");
 const debugLogger = require("./debugLogger");
 const { killProcess } = require("../utils/process");
+const { isPortAvailable } = require("../utils/serverUtils");
 const { getSafeTempDir } = require("./safeTempDir");
 const { app } = require("electron");
+const sidecarPidFile = require("./sidecarPidFile");
+const { BIN_SUBDIR: LLAMA_VULKAN_BIN_SUBDIR } = require("./llamaVulkanManager");
+const { BASELINE_CONTEXT_SIZE } = require("./llamaContextPolicy");
 
-const PORT_RANGE_START = 8200;
-const PORT_RANGE_END = 8220;
-const STARTUP_TIMEOUT_MS = 60000;
-const VULKAN_STARTUP_TIMEOUT_MS = 10000;
+// Range kept clear of cliBridge (8200-8219) to avoid port-bind collisions.
+const PORT_RANGE_START = 8221;
+const PORT_RANGE_END = 8240;
+const STARTUP_TIMEOUT_MS = 120000;
+const VULKAN_STARTUP_TIMEOUT_MS = 120000;
 const HEALTH_CHECK_INTERVAL_MS = 5000;
 const HEALTH_CHECK_TIMEOUT_MS = 2000;
 const STARTUP_POLL_INTERVAL_MS = 500;
 const HEALTH_CHECK_FAILURE_THRESHOLD = 3;
+const IDLE_TIMEOUT_MS = 5 * 60 * 1000;
+const DEFAULT_CONTEXT_SIZE = 4096;
+const PREFLIGHT_TIMEOUT_MS = 10000;
+
+/**
+ * llama-server reports a prompt that overflows the context as a 400 whose body
+ * is a JSON blob. Surfacing that verbatim is how customers ended up reading
+ * llama.cpp internals in a toast (#2142), so it becomes a typed error carrying
+ * the two numbers callers actually need.
+ */
+/** Same argv with --ctx-size rewritten; used by the context step-down rung. */
+function withContextSize(args, contextSize) {
+  const index = args.indexOf("--ctx-size");
+  if (index === -1) return args;
+  const copy = [...args];
+  copy[index + 1] = String(contextSize);
+  return copy;
+}
+
+function buildResponseError(statusCode, body) {
+  if (statusCode === 400) {
+    try {
+      const parsed = JSON.parse(body)?.error;
+      const isOverflow =
+        parsed?.type === "exceed_context_size_error" ||
+        /exceeds the available context size/i.test(parsed?.message || "");
+
+      if (isOverflow) {
+        const neededTokens = Number(parsed.n_prompt_tokens) || null;
+        const maxContextTokens = Number(parsed.n_ctx) || null;
+        const error = new Error(
+          neededTokens && maxContextTokens
+            ? `The request needs ${neededTokens} tokens of context but the model is running with ${maxContextTokens}.`
+            : "The request is longer than the context this model is running with."
+        );
+        error.code = "CONTEXT_TOO_LARGE";
+        error.neededTokens = neededTokens;
+        error.maxContextTokens = maxContextTokens;
+        return error;
+      }
+    } catch {
+      // Not JSON, or not the shape we expect: fall through to the generic error.
+    }
+  }
+
+  return new Error(`llama-server returned status ${statusCode}: ${body}`);
+}
 
 class LlamaServerManager {
   constructor() {
@@ -23,11 +74,23 @@ class LlamaServerManager {
     this.port = null;
     this.ready = false;
     this.modelPath = null;
+    // draftModelPath is the REQUESTED drafter (stable across identical requests, drives
+    // the start() restart check); activeDraftModelPath is the one that actually loaded.
+    this.draftModelPath = null;
+    this.activeDraftModelPath = null;
+    // The context that actually loaded, which the GPU ladder may step down
+    // below the requested one.
+    this.activeContextSize = null;
+    // The context the running server was started with. Grows on demand and is
+    // only reset by stop(), so a short request cannot shrink a window a long
+    // one just paid to open. See #2142.
+    this.contextSize = null;
     this.startupPromise = null;
     this.healthCheckInterval = null;
     this.healthCheckFailures = 0;
     this.cachedServerBinaryPaths = null;
     this.activeBackend = null;
+    this.idleTimer = null;
   }
 
   getServerBinaryPaths() {
@@ -65,11 +128,16 @@ class LlamaServerManager {
         resolveBinary(`llama-server-${platformArch}`) || resolveBinary(`llama-server${ext}`);
       paths = defaultBin ? { default: defaultBin } : {};
     } else {
-      const userBinDir = path.join(app.getPath("userData"), "bin");
       const vulkanName = `llama-server-vulkan${ext}`;
       let vulkanBin = null;
       try {
-        const vulkanPath = path.join(userBinDir, vulkanName);
+        // Installed by LlamaVulkanManager into its own pack directory
+        const vulkanPath = path.join(
+          app.getPath("userData"),
+          "bin",
+          LLAMA_VULKAN_BIN_SUBDIR,
+          vulkanName
+        );
         if (fs.existsSync(vulkanPath)) vulkanBin = vulkanPath;
       } catch {}
 
@@ -83,7 +151,11 @@ class LlamaServerManager {
       if (cpuBin) paths.cpu = cpuBin;
     }
 
-    this.cachedServerBinaryPaths = paths;
+    // Only cache hits: a miss may be transient (binary downloaded after
+    // startup), and caching it would require an app restart to recover.
+    if (Object.keys(paths).length > 0) {
+      this.cachedServerBinaryPaths = paths;
+    }
     return paths;
   }
 
@@ -94,27 +166,25 @@ class LlamaServerManager {
 
   async findAvailablePort() {
     for (let port = PORT_RANGE_START; port <= PORT_RANGE_END; port++) {
-      if (await this.isPortAvailable(port)) return port;
+      if (await isPortAvailable(port)) return port;
     }
     throw new Error(`No available ports in range ${PORT_RANGE_START}-${PORT_RANGE_END}`);
-  }
-
-  isPortAvailable(port) {
-    return new Promise((resolve) => {
-      const server = net.createServer();
-      server.once("error", () => resolve(false));
-      server.once("listening", () => {
-        server.close();
-        resolve(true);
-      });
-      server.listen(port, "127.0.0.1");
-    });
   }
 
   async start(modelPath, options = {}) {
     if (this.startupPromise) return this.startupPromise;
 
-    if (this.ready && this.modelPath === modelPath) return;
+    // A change in drafter presence for the same model must still restart the
+    // server so the new speculative-decoding flags take effect.
+    const requestedDraftPath = options.draftModelPath || null;
+    const requestedContextSize = options.contextSize || DEFAULT_CONTEXT_SIZE;
+    if (
+      this.ready &&
+      this.modelPath === modelPath &&
+      this.draftModelPath === requestedDraftPath &&
+      requestedContextSize <= (this.contextSize || 0)
+    )
+      return;
 
     if (this.process) {
       await this.stop();
@@ -123,9 +193,38 @@ class LlamaServerManager {
     this.startupPromise = this._doStart(modelPath, options);
     try {
       await this.startupPromise;
+      // The ladder may have stepped the context down to get a GPU rung to
+      // start; record what loaded, not what was asked for.
+      this.contextSize = this.activeContextSize ?? requestedContextSize;
     } finally {
       this.startupPromise = null;
     }
+  }
+
+  _buildBaseArgs(modelPath, port, options = {}) {
+    const args = [
+      "--model",
+      modelPath,
+      "--host",
+      "127.0.0.1",
+      "--port",
+      String(port),
+      "--threads",
+      String(options.threads || 4),
+      // Unset, this defaults to the model's full trained context (128K+),
+      // whose KV cache can exceed total RAM with --fit disabled. See #1203.
+      // Sized per request against a memory budget by llamaContextPolicy.
+      "--ctx-size",
+      String(options.contextSize || DEFAULT_CONTEXT_SIZE),
+      "--jinja",
+    ];
+
+    // llama-server otherwise reserves 8192 MiB of host RAM for the prompt
+    // cache, on top of the KV cache, which would undo the memory budget. Cap
+    // it rather than disabling it: 0 forces a full re-prefill every request.
+    if (options.cacheRamMiB) args.push("--cache-ram", String(options.cacheRamMiB));
+
+    return args;
   }
 
   async _doStart(modelPath, options = {}) {
@@ -135,21 +234,30 @@ class LlamaServerManager {
 
     this.port = await this.findAvailablePort();
     this.modelPath = modelPath;
+    // Store the REQUESTED drafter so start() compares against a stable value across
+    // identical requests; activeDraftModelPath tracks what actually loaded (see ctor).
+    this.draftModelPath = options.draftModelPath || null;
+    this.activeDraftModelPath = null;
 
-    // Let llama.cpp's auto-fit system choose --ctx-size based on available GPU memory
-    const baseArgs = [
-      "--model",
-      modelPath,
-      "--host",
-      "127.0.0.1",
-      "--port",
-      String(this.port),
-      "--threads",
-      String(options.threads || 4),
-    ];
+    this.activeContextSize = options.contextSize || DEFAULT_CONTEXT_SIZE;
+    const baseArgs = this._buildBaseArgs(modelPath, this.port, options);
+
+    // Draft flags stay separate from baseArgs so the fallback ladder can retry without
+    // them when a stale (pre-b9763) binary rejects the MTP args at parse time.
+    const draftArgs = options.draftModelPath
+      ? [
+          "--model-draft",
+          options.draftModelPath,
+          "--spec-type",
+          "draft-mtp",
+          "--spec-draft-n-max",
+          "3",
+        ]
+      : [];
 
     if (process.platform === "darwin") {
-      const args = [...baseArgs, "--n-gpu-layers", "99"];
+      // The metal binary is always the bundled pin, so it never rejects the draft flags.
+      const args = [...baseArgs, "--n-gpu-layers", String(options.gpuLayers ?? 99), ...draftArgs];
       await this._startWithBinary(
         binaryPaths.default,
         args,
@@ -157,50 +265,126 @@ class LlamaServerManager {
         STARTUP_TIMEOUT_MS
       );
       this.activeBackend = "metal";
+      this.activeDraftModelPath = this.draftModelPath;
     } else {
-      await this._startWithGpuFallback(binaryPaths, baseArgs, options);
+      await this._startWithGpuFallback(binaryPaths, baseArgs, options, draftArgs);
     }
 
     this.startHealthCheck();
+    this.resetIdleTimer();
     debugLogger.info("llama-server started successfully", {
       port: this.port,
       model: path.basename(modelPath),
       backend: this.activeBackend,
+      mtp: this.activeDraftModelPath !== null,
     });
   }
 
-  async _startWithGpuFallback(binaryPaths, baseArgs, options) {
-    const gpuArgs = [...baseArgs, "--n-gpu-layers", "99"];
+  async _startWithGpuFallback(binaryPaths, baseArgs, options, draftArgs = []) {
+    const gpuArgs = [...baseArgs, "--n-gpu-layers", String(options.gpuLayers ?? 99)];
     const cpuArgs = baseArgs;
+    const hasDraft = draftArgs.length > 0;
+    const requestedContext = options.contextSize || DEFAULT_CONTEXT_SIZE;
 
-    if (binaryPaths.vulkan) {
+    // Degrade ladder: GPU+MTP, then GPU alone (a live GPU beats speculation), then
+    // CPU+MTP (the bundled pin normally accepts the flags), then plain CPU. The
+    // no-draft rungs collapse into their twins when no drafter is declared, so a
+    // drafterless start keeps today's exact single vulkan->cpu fallback.
+    const rungs = [
+      {
+        backend: "vulkan",
+        name: "Vulkan",
+        binary: binaryPaths.vulkan,
+        args: [...gpuArgs, ...draftArgs],
+        mtp: hasDraft,
+        timeout: VULKAN_STARTUP_TIMEOUT_MS,
+        attemptMsg: "Attempting Vulkan backend startup",
+      },
+      {
+        backend: "vulkan",
+        name: "Vulkan",
+        binary: binaryPaths.vulkan,
+        args: gpuArgs,
+        mtp: false,
+        noDraft: true,
+        timeout: VULKAN_STARTUP_TIMEOUT_MS,
+        attemptMsg: "Attempting Vulkan backend startup",
+      },
+      // A context sized against system RAM can still be too big for a
+      // discrete GPU's own memory, which the app does not probe. Halving it is
+      // far cheaper than the 10-30x cost of dropping to CPU, so try that
+      // first. Omitted entirely when there is nothing to step down to, so a
+      // baseline start keeps today's exact ladder.
+      ...(requestedContext > BASELINE_CONTEXT_SIZE && binaryPaths.vulkan
+        ? [
+            {
+              backend: "vulkan",
+              name: "Vulkan (reduced context)",
+              binary: binaryPaths.vulkan,
+              args: withContextSize(gpuArgs, BASELINE_CONTEXT_SIZE),
+              mtp: false,
+              contextSize: BASELINE_CONTEXT_SIZE,
+              timeout: VULKAN_STARTUP_TIMEOUT_MS,
+              attemptMsg: "Attempting Vulkan backend startup with a reduced context",
+            },
+          ]
+        : []),
+      {
+        backend: "cpu",
+        name: "CPU",
+        binary: binaryPaths.cpu,
+        args: [...cpuArgs, ...draftArgs],
+        mtp: hasDraft,
+        timeout: STARTUP_TIMEOUT_MS,
+        attemptMsg: "Starting with CPU backend",
+      },
+      {
+        backend: "cpu",
+        name: "CPU",
+        binary: binaryPaths.cpu,
+        args: cpuArgs,
+        mtp: false,
+        noDraft: true,
+        timeout: STARTUP_TIMEOUT_MS,
+        attemptMsg: "Starting with CPU backend",
+      },
+    ];
+
+    const ladder = rungs.filter((rung) => rung.binary && !(rung.noDraft && !hasDraft));
+    if (ladder.length === 0) throw new Error("No CPU llama-server binary available");
+
+    let lastError = null;
+    for (let i = 0; i < ladder.length; i++) {
+      const rung = ladder[i];
+      const next = ladder[i + 1];
       try {
-        debugLogger.debug("Attempting Vulkan backend startup");
+        debugLogger.debug(rung.attemptMsg);
         await this._startWithBinary(
-          binaryPaths.vulkan,
-          gpuArgs,
-          this._buildEnv(binaryPaths.vulkan),
-          VULKAN_STARTUP_TIMEOUT_MS
+          rung.binary,
+          rung.args,
+          this._buildEnv(rung.binary),
+          rung.timeout
         );
-        this.activeBackend = "vulkan";
+        this.activeBackend = rung.backend;
+        this.activeDraftModelPath = rung.mtp ? this.draftModelPath : null;
+        // Without this the preflight would believe the full context is
+        // available and send a prompt the server cannot take.
+        this.activeContextSize = rung.contextSize ?? requestedContext;
+        this.contextSize = this.activeContextSize;
         return;
       } catch (err) {
-        debugLogger.warn("Vulkan backend failed, falling back to CPU", { error: err.message });
-        await this._killCurrentProcess();
-        this.port = await this.findAvailablePort();
+        lastError = err;
+        if (next) {
+          debugLogger.warn(`${rung.name} backend failed, falling back to ${next.name}`, {
+            error: err.message,
+          });
+          await this._killCurrentProcess();
+          this.port = await this.findAvailablePort();
+        }
       }
     }
 
-    if (!binaryPaths.cpu) throw new Error("No CPU llama-server binary available");
-
-    debugLogger.debug("Starting with CPU backend");
-    await this._startWithBinary(
-      binaryPaths.cpu,
-      cpuArgs,
-      this._buildEnv(binaryPaths.cpu),
-      STARTUP_TIMEOUT_MS
-    );
-    this.activeBackend = "cpu";
+    throw lastError || new Error("No CPU llama-server binary available");
   }
 
   _buildEnv(binaryPath) {
@@ -215,6 +399,16 @@ class LlamaServerManager {
       env.PATH = binDir + (env.PATH ? `;${env.PATH}` : "");
     }
 
+    // Select GPU by UUID + PCI_BUS_ID order so the device is unambiguous. See #531.
+    env.CUDA_DEVICE_ORDER = "PCI_BUS_ID";
+    if (process.env.INTELLIGENCE_GPU_UUID) {
+      env.CUDA_VISIBLE_DEVICES = process.env.INTELLIGENCE_GPU_UUID;
+    }
+
+    // Disable llama.cpp auto-fit memory probing (adds ~70s to startup). Set via env
+    // so builds without --fit ignore it instead of erroring. See LLAMA_ARG_FIT.
+    env.LLAMA_ARG_FIT = process.env.LLAMA_ARG_FIT || "off";
+
     return env;
   }
 
@@ -227,7 +421,9 @@ class LlamaServerManager {
         windowsHide: true,
         cwd: getSafeTempDir(),
         env,
+        detached: process.platform !== "win32",
       });
+      sidecarPidFile.write("llama", this.process.pid);
 
       let stderrBuffer = "";
       let exitCode = null;
@@ -262,6 +458,7 @@ class LlamaServerManager {
         this.ready = false;
         this.process = null;
         this.stopHealthCheck();
+        sidecarPidFile.clear("llama");
       });
 
       const getProcessInfo = () => ({ stderr: stderrBuffer, exitCode, exitSignal });
@@ -407,17 +604,129 @@ class LlamaServerManager {
     }
   }
 
+  resetIdleTimer() {
+    this.clearIdleTimer();
+    this.idleTimer = setTimeout(() => {
+      debugLogger.info("llama-server idle timeout reached, stopping to free VRAM", {
+        timeoutMs: IDLE_TIMEOUT_MS,
+        model: this.modelPath ? path.basename(this.modelPath) : null,
+      });
+      this.stop();
+    }, IDLE_TIMEOUT_MS);
+  }
+
+  clearIdleTimer() {
+    if (this.idleTimer) {
+      clearTimeout(this.idleTimer);
+      this.idleTimer = null;
+    }
+  }
+
+  /**
+   * Small JSON round-trip against the running server.
+   *
+   * Resolves null on any failure rather than rejecting: these calls exist to
+   * make a decision more precise, so a broken one must degrade to the estimate
+   * and never fail the user's request.
+   */
+  _requestJson(path, body = null, timeoutMs = PREFLIGHT_TIMEOUT_MS) {
+    return new Promise((resolve) => {
+      const payload = body === null ? null : JSON.stringify(body);
+      const req = http.request(
+        {
+          hostname: "127.0.0.1",
+          port: this.port,
+          path,
+          method: payload === null ? "GET" : "POST",
+          headers: payload
+            ? {
+                "Content-Type": "application/json",
+                "Content-Length": Buffer.byteLength(payload),
+              }
+            : {},
+          timeout: timeoutMs,
+        },
+        (res) => {
+          let data = "";
+          res.on("data", (chunk) => {
+            data += chunk;
+          });
+          res.on("end", () => {
+            if (res.statusCode !== 200) return resolve(null);
+            try {
+              resolve(JSON.parse(data));
+            } catch {
+              resolve(null);
+            }
+          });
+        }
+      );
+
+      req.on("error", () => resolve(null));
+      req.on("timeout", () => {
+        req.destroy();
+        resolve(null);
+      });
+      if (payload) req.write(payload);
+      req.end();
+    });
+  }
+
+  /**
+   * The context window actually in force, which is not always what we asked
+   * for: a concurrent caller can join an in-flight start that used a smaller
+   * size. Returns null when it cannot be read.
+   */
+  async usableContextSize() {
+    if (!this.ready || !this.process) return null;
+    const props = await this._requestJson("/props");
+    const contextSize = props?.default_generation_settings?.n_ctx;
+    return Number.isFinite(contextSize) && contextSize > 0 ? contextSize : null;
+  }
+
+  /**
+   * Exact token count for the prompt as the server will actually see it, chat
+   * template included. Roughly 15 ms for an 85 KB prompt, which is cheap
+   * enough to make the difference between a right-sized window and a 400.
+   */
+  async countPromptTokens(messages, options = {}) {
+    if (!this.ready || !this.process) return null;
+
+    const payload = { messages };
+    // Must mirror inference() exactly, or we would price a different prompt
+    // than the one we go on to send.
+    if (options.disableThinking !== false) {
+      payload.chat_template_kwargs = { enable_thinking: false };
+    }
+
+    const templated = await this._requestJson("/apply-template", payload);
+    if (typeof templated?.prompt !== "string") return null;
+
+    const tokenized = await this._requestJson("/tokenize", { content: templated.prompt });
+    return Array.isArray(tokenized?.tokens) ? tokenized.tokens.length : null;
+  }
+
   async inference(messages, options = {}) {
     if (!this.ready || !this.process) {
       throw new Error("llama-server is not running");
     }
 
-    const body = JSON.stringify({
+    this.clearIdleTimer();
+
+    const requestBody = {
       messages,
       temperature: options.temperature ?? 0.7,
       max_tokens: options.max_tokens ?? 512,
       stream: false,
-    });
+    };
+
+    // Without this, Qwen chat templates leave `message.content` empty and
+    // route output into `reasoning_content`. Non-Qwen templates ignore it.
+    if (options.disableThinking !== false) {
+      requestBody.chat_template_kwargs = { enable_thinking: false };
+    }
+
+    const body = JSON.stringify(requestBody);
 
     return new Promise((resolve, reject) => {
       const startTime = Date.now();
@@ -446,13 +755,21 @@ class LlamaServerManager {
             });
 
             if (res.statusCode !== 200) {
-              reject(new Error(`llama-server returned status ${res.statusCode}: ${data}`));
+              reject(buildResponseError(res.statusCode, data));
               return;
             }
 
             try {
               const response = JSON.parse(data);
-              const text = response.choices?.[0]?.message?.content || "";
+              if (
+                options.requireCompleteOutput &&
+                ["length", "max_tokens"].includes(response.choices?.[0]?.finish_reason)
+              ) {
+                reject(new Error("Model output was truncated before the selection edit completed"));
+                return;
+              }
+              const message = response.choices?.[0]?.message;
+              const text = message?.content || message?.reasoning_content || "";
               resolve(text.trim());
             } catch (e) {
               reject(new Error(`Failed to parse llama-server response: ${e.message}`));
@@ -471,14 +788,16 @@ class LlamaServerManager {
 
       req.write(body);
       req.end();
-    });
+    }).finally(() => this.resetIdleTimer());
   }
 
   async stop() {
+    this.clearIdleTimer();
     this.stopHealthCheck();
 
     if (!this.process) {
       this.ready = false;
+      this.contextSize = null;
       return;
     }
 
@@ -513,7 +832,11 @@ class LlamaServerManager {
     this.ready = false;
     this.port = null;
     this.modelPath = null;
+    this.draftModelPath = null;
+    this.activeDraftModelPath = null;
     this.activeBackend = null;
+    this.contextSize = null;
+    this.activeContextSize = null;
   }
 
   getStatus() {

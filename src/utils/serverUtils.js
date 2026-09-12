@@ -1,20 +1,26 @@
 const fs = require("fs");
 const net = require("net");
 const path = require("path");
-const { killProcess } = require("./process");
+const { killProcessGroup } = require("./process");
 
 const GRACEFUL_STOP_TIMEOUT_MS = 5000;
 
-function isPortAvailable(port) {
+function tryBind(port, host) {
   return new Promise((resolve) => {
-    const server = net.createServer();
-    server.once("error", () => resolve(false));
-    server.once("listening", () => {
-      server.close();
-      resolve(true);
-    });
-    server.listen(port, "127.0.0.1");
+    const s = net.createServer();
+    // A host whose address family is absent (e.g. IPv6 disabled) can't conflict on the port.
+    s.once("error", (err) => resolve(err.code === "EADDRNOTAVAIL" || err.code === "EAFNOSUPPORT"));
+    s.once("listening", () => s.close(() => resolve(true)));
+    s.listen(port, host);
   });
+}
+
+async function isPortAvailable(port) {
+  return (
+    (await tryBind(port, "0.0.0.0")) &&
+    (await tryBind(port, "::")) &&
+    (await tryBind(port, "127.0.0.1"))
+  );
 }
 
 async function findAvailablePort(rangeStart, rangeEnd) {
@@ -49,11 +55,11 @@ function resolveBinaryPath(binaryName) {
 }
 
 async function gracefulStopProcess(proc) {
-  killProcess(proc, "SIGTERM");
+  killProcessGroup(proc, "SIGTERM");
 
   await new Promise((resolve) => {
     const timeout = setTimeout(() => {
-      if (proc) killProcess(proc, "SIGKILL");
+      if (proc) killProcessGroup(proc, "SIGKILL");
       resolve();
     }, GRACEFUL_STOP_TIMEOUT_MS);
 

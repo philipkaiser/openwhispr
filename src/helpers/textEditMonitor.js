@@ -8,16 +8,53 @@ const POLL_INTERVAL_MS = 500;
 const INITIAL_QUERY_DELAY_MS = 500; // Wait for paste to settle in target app
 const INITIAL_QUERY_RETRIES = 4; // Retry if AXValue is empty (paste not yet processed)
 const INITIAL_QUERY_RETRY_DELAY_MS = 300;
+const ACTIVATE_CONFIRM_RETRIES = 6; // Poll the frontmost app until activation lands
+const ACTIVATE_CONFIRM_DELAY_MS = 25;
+// One dictation triggers target captures from several call sites (hotkey press,
+// toggle path, recording start) within a few hundred ms; reuse the result
+// across that burst. Kept short so back-to-back dictations in different apps
+// still get a fresh capture.
+const TARGET_CAPTURE_FRESHNESS_MS = 250;
+// Must outlast the binary's retry ladder (5 attempts, 300ms apart, ~1.25s): a
+// killed run's verdict is discarded, so a tighter timeout means the app below is
+// never learned and every read pays the full ladder.
+const SELECTED_TEXT_TIMEOUT_MS = 1600;
+// AXError -25212 (kAXErrorNoValue) on the focused-element read is how
+// Chromium/Electron apps respond while their AX tree is dormant, making the
+// native binary's 5-attempt retry (~1.2s) dead time on every read. A single
+// -25212 line can also be transient (the tree may wake mid-run — the binary
+// then logs "Got focused element on attempt N"), so only a run where the
+// element never resolved and every attempt failed with -25212 marks the app
+// as unsupported for this session.
+function isPersistentAxNoValueFailure(stderr) {
+  const text = stderr || "";
+  if (text.includes("Got focused element")) return false;
+  const attemptCodes = text.match(/\(error: -?\d+\)/g) || [];
+  return attemptCodes.length > 0 && attemptCodes.every((code) => code === "(error: -25212)");
+}
 
-// AppleScript to enable AXEnhancedUserInterface on the target app.
-// Chromium-based apps (Chrome, Electron, VS Code, Slack, etc.) don't build their
-// accessibility tree until an assistive technology announces itself via this attribute.
-// This is the same technique Grammarly uses on macOS.
-const MACOS_AX_ENABLE_SCRIPT = (pid) =>
+// Monitoring is strictly read-only: never write AXEnhancedUserInterface (or any
+// AX attribute) on the target app to force its accessibility tree. Flipping that
+// flag switches the whole process into screen-reader mode for its lifetime and
+// blurs the focused editor in some Chromium apps (Claude Desktop, claude.ai),
+// so every dictation after the first pasted into a field that no longer had
+// keyboard focus. Modern Chromium builds the tree on demand when our
+// reads arrive; where it doesn't, we skip auto-learn for that paste instead.
+
+// Read the exact current selection without touching the clipboard. Prefixes
+// distinguish an empty selection from an inaccessible target so selection
+// editing can fail closed when Accessibility cannot inspect the focused field.
+const MACOS_AX_SELECTED_TEXT_SCRIPT = (pid) =>
   `tell application "System Events"\n` +
-  `\tset targetProc to first application process whose unix id is ${pid}\n` +
   `\ttry\n` +
-  `\t\tset value of attribute "AXEnhancedUserInterface" of targetProc to true\n` +
+  `\t\tset targetProc to first application process whose unix id is ${pid}\n` +
+  `\t\tset focAttr to value of attribute "AXFocusedUIElement" of targetProc\n` +
+  `\t\tif focAttr is missing value then return "UNAVAILABLE:"\n` +
+  `\t\tset selectedValue to value of attribute "AXSelectedText" of focAttr\n` +
+  `\t\tif selectedValue is missing value or selectedValue is "" then return "NONE:"\n` +
+  `\t\treturn "SELECTED:" & selectedValue\n` +
+  `\ton error\n` +
+  `\t\treturn "UNAVAILABLE:"\n` +
   `\tend try\n` +
   `end tell`;
 
@@ -53,6 +90,13 @@ class TextEditMonitor extends EventEmitter {
     this._lastValue = null;
     this._stdoutBuffer = "";
     this.lastTargetPid = null;
+    this._captureTargetPromise = null;
+    this._lastCaptureAt = 0;
+    this._windowBounds = null;
+    // PIDs whose AX tree never yields a focused element (see
+    // isPersistentAxNoValueFailure). A recycled PID only costs a detour via
+    // AppleScript, which is still correct.
+    this._nativeSelectionUnsupportedPids = new Set();
   }
 
   /**
@@ -60,20 +104,285 @@ class TextEditMonitor extends EventEmitter {
    * Must be called at hotkey press time, BEFORE showDictationPanel()/mainWindow.show().
    * NSWorkspace.frontmostApplication correctly identifies the key window owner,
    * ignoring panel-type windows like the OpenWhispr overlay.
+   *
+   * Resolves with the captured PID (or null). At most one lookup runs at a
+   * time: concurrent calls share the in-flight lookup, so an older lookup can
+   * never overwrite a newer target, and a just-captured result is reused
+   * briefly so the press-time and recording-start captures of one dictation
+   * cost a single osascript spawn instead of several.
    */
   captureTargetPid() {
-    if (process.platform !== "darwin") return;
-    const script =
-      'ObjC.import("AppKit"); $.NSWorkspace.sharedWorkspace.frontmostApplication.processIdentifier';
-    execFile("osascript", ["-l", "JavaScript", "-e", script], { timeout: 2000 }, (err, stdout) => {
-      if (err) {
-        this.lastTargetPid = null;
-      } else {
-        const pid = parseInt(stdout.trim(), 10);
-        this.lastTargetPid = isNaN(pid) ? null : pid;
-      }
-      debugLogger.debug("[TextEditMonitor] Captured target PID", { pid: this.lastTargetPid });
+    if (process.platform !== "darwin") return Promise.resolve(null);
+    if (this._captureTargetPromise) return this._captureTargetPromise;
+    if (
+      this.lastTargetPid !== null &&
+      Date.now() - this._lastCaptureAt < TARGET_CAPTURE_FRESHNESS_MS
+    ) {
+      return Promise.resolve(this.lastTargetPid);
+    }
+    this.lastTargetPid = null;
+    this._captureTargetPromise = this._readFrontmostPid().then((pid) => {
+      this._captureTargetPromise = null;
+      this._lastCaptureAt = Date.now();
+      this.lastTargetPid = pid;
+      debugLogger.debug("[TextEditMonitor] Captured target PID", { pid });
+      return pid;
     });
+    return this._captureTargetPromise;
+  }
+
+  /**
+   * macOS: resolve the frontmost app's PID, or null if it can't be read.
+   */
+  _readFrontmostPid() {
+    return new Promise((resolve) => {
+      if (process.platform !== "darwin") {
+        resolve(null);
+        return;
+      }
+      const script =
+        'ObjC.import("AppKit"); $.NSWorkspace.sharedWorkspace.frontmostApplication.processIdentifier';
+      execFile(
+        "osascript",
+        ["-l", "JavaScript", "-e", script],
+        { timeout: 2000 },
+        (err, stdout) => {
+          const pid = err ? NaN : parseInt(stdout.trim(), 10);
+          resolve(isNaN(pid) ? null : pid);
+        }
+      );
+    });
+  }
+
+  /**
+   * macOS: request activation of the app with the given PID, bringing all its
+   * windows forward (AllWindows|IgnoringOtherApps) so one becomes key. Scans
+   * runningApplications because NSRunningApplication's PID lookup returns nil under JXA.
+   */
+  _activateApp(pid) {
+    return new Promise((resolve) => {
+      const script = `
+        ObjC.import("AppKit");
+        const apps = $.NSWorkspace.sharedWorkspace.runningApplications;
+        for (let i = 0; i < apps.count; i++) {
+          const a = apps.objectAtIndex(i);
+          if (a.processIdentifier === ${pid}) { a.activateWithOptions(3); break; }
+        }
+      `;
+      execFile("osascript", ["-l", "JavaScript", "-e", script], { timeout: 2000 }, () => resolve());
+    });
+  }
+
+  /**
+   * macOS: make the captured target app frontmost before pasting, so the global
+   * Cmd+V lands in its focused field (#668). Resolves true once the target is
+   * confirmed frontmost. If it is already frontmost we do nothing: re-activating
+   * an already-active Chromium app (e.g. Claude Desktop) drops its field's first
+   * responder — the focus loss this fixes — and skipping also avoids a needless
+   * activation round-trip. Otherwise we activate and poll until the OS reports the
+   * target frontmost, the macOS analogue of Linux's `xdotool windowactivate --sync`.
+   */
+  async activateTargetPid() {
+    if (process.platform !== "darwin" || !this.lastTargetPid) return false;
+    return this.activatePid(this.lastTargetPid);
+  }
+
+  async activatePid(pid) {
+    if (process.platform !== "darwin" || !pid) return false;
+    if ((await this._readFrontmostPid()) === pid) return true;
+
+    await this._activateApp(pid);
+    for (let i = 0; i < ACTIVATE_CONFIRM_RETRIES; i++) {
+      await new Promise((resolve) => setTimeout(resolve, ACTIVATE_CONFIRM_DELAY_MS));
+      if ((await this._readFrontmostPid()) === pid) {
+        debugLogger.debug("[TextEditMonitor] Activated target PID", { pid });
+        return true;
+      }
+    }
+    debugLogger.debug("[TextEditMonitor] Target did not become frontmost", { pid });
+    return false;
+  }
+
+  getSelectedText(pid, timeoutMs = SELECTED_TEXT_TIMEOUT_MS) {
+    return new Promise((resolve) => {
+      if (process.platform !== "darwin" || !pid) {
+        resolve({ state: "unavailable" });
+        return;
+      }
+
+      const resolved = this.resolveBinary();
+      if (resolved && !this._nativeSelectionUnsupportedPids.has(pid)) {
+        execFile(
+          resolved.command,
+          [...resolved.args, "--selected-text", String(pid)],
+          { timeout: timeoutMs },
+          (error, stdout, stderr) => {
+            const output = stdout.replace(/\n$/, "");
+            if (output === "EDITABLE_NONE:") {
+              resolve({ state: "none", editable: true });
+              return;
+            }
+            if (output === "NONE:") {
+              resolve({ state: "none" });
+              return;
+            }
+            if (output.startsWith("SELECTED_B64:")) {
+              try {
+                resolve({
+                  state: "selected",
+                  text: Buffer.from(output.slice("SELECTED_B64:".length), "base64").toString(
+                    "utf8"
+                  ),
+                });
+                return;
+              } catch (decodeError) {
+                debugLogger.debug("[TextEditMonitor] Failed to decode native selected text", {
+                  error: decodeError.message,
+                });
+              }
+            }
+            if (output.startsWith("SELECTED:")) {
+              resolve({ state: "selected", text: output.slice("SELECTED:".length) });
+              return;
+            }
+
+            // A timeout-killed child never finished the retry ladder — the
+            // tree could have woken on a later attempt — so only a completed
+            // run's verdict counts (the untimed monitor path also teaches).
+            if (!error?.killed && isPersistentAxNoValueFailure(stderr || error?.message || "")) {
+              this._nativeSelectionUnsupportedPids.add(pid);
+            }
+            debugLogger.debug(
+              "[TextEditMonitor] Native selected-text read unavailable; trying AppleScript",
+              {
+                pid,
+                error: error?.message || null,
+                stderr: stderr?.trim() || null,
+                nativeSkippedNextTime: this._nativeSelectionUnsupportedPids.has(pid),
+              }
+            );
+            this._getSelectedTextViaAppleScript(pid, timeoutMs, resolve);
+          }
+        );
+        return;
+      }
+
+      this._getSelectedTextViaAppleScript(pid, timeoutMs, resolve);
+    });
+  }
+
+  _getSelectedTextViaAppleScript(pid, timeoutMs, resolve) {
+    execFile(
+      "osascript",
+      ["-e", MACOS_AX_SELECTED_TEXT_SCRIPT(pid)],
+      { timeout: timeoutMs },
+      (err, stdout) => {
+        if (err) {
+          resolve({ state: "unavailable" });
+          return;
+        }
+
+        // The AppleScript never reports an editable caret (only the native
+        // binary emits EDITABLE_NONE:), so this fallback can read selections
+        // but never produce a caret delivery target — panel-first by design.
+        const output = stdout.replace(/\n$/, "");
+        if (output === "NONE:") {
+          resolve({ state: "none" });
+        } else if (output.startsWith("SELECTED:")) {
+          resolve({ state: "selected", text: output.slice("SELECTED:".length) });
+        } else {
+          resolve({ state: "unavailable" });
+        }
+      }
+    );
+  }
+
+  async isFocusedEditable(target, timeoutMs = 1000) {
+    const resolved = this.resolveBinary();
+    if (!resolved) return false;
+
+    let args;
+    if (process.platform === "darwin") {
+      const pid = target?.kind === "mac-pid" ? target.pid : this.lastTargetPid;
+      if (!pid) return false;
+      args = [...resolved.args, "--editable-target", String(pid)];
+    } else {
+      args = [...resolved.args, "--probe-editable"];
+    }
+
+    // The verdict is the first output line. A stale binary that predates the
+    // probe flag falls into monitor mode instead: it blocks reading stdin,
+    // then emits its monitor output and keeps running — closing stdin and
+    // resolving on that first line keeps the stale case a fast "not editable"
+    // rather than a hang until the timeout.
+    return new Promise((resolve) => {
+      const child = spawn(resolved.command, args, { stdio: ["pipe", "pipe", "ignore"] });
+      let buffered = "";
+      let settled = false;
+      const settle = (verdict) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        try {
+          child.kill();
+        } catch {}
+        resolve(verdict);
+      };
+      const timer = setTimeout(() => settle(false), timeoutMs);
+      child.stdin.on("error", () => {});
+      child.stdin.end();
+      child.stdout.on("data", (data) => {
+        buffered += data.toString();
+        const newline = buffered.indexOf("\n");
+        if (newline !== -1) settle(buffered.slice(0, newline).trim() === "EDITABLE");
+      });
+      child.on("error", () => settle(false));
+      child.on("close", () => settle(buffered.trim() === "EDITABLE"));
+    });
+  }
+
+  /**
+   * macOS: the target app's largest on-screen window rect, used to decide which
+   * display the user is working on. Resolves to null when the app has no
+   * ordinary window (or off macOS), leaving the caller to fall back to the
+   * cursor. Cached over the same press-time burst as captureTargetPid, so the
+   * dictation panel and the screen-context capture share one spawn.
+   */
+  async getTargetWindowBounds(pid, timeoutMs = 700) {
+    if (process.platform !== "darwin" || !pid) return null;
+    if (
+      this._windowBounds?.pid === pid &&
+      Date.now() - this._windowBounds.at < TARGET_CAPTURE_FRESHNESS_MS
+    ) {
+      return this._windowBounds.bounds;
+    }
+
+    const resolved = this.resolveBinary();
+    if (!resolved) return null;
+
+    const bounds = await new Promise((resolve) => {
+      execFile(
+        resolved.command,
+        [...resolved.args, "--window-bounds", String(pid)],
+        { timeout: timeoutMs },
+        (error, stdout) => {
+          const match = stdout?.match(/^BOUNDS:(-?\d+),(-?\d+),(\d+),(\d+)$/m);
+          if (!match) {
+            resolve(null);
+            return;
+          }
+          resolve({
+            x: Number(match[1]),
+            y: Number(match[2]),
+            width: Number(match[3]),
+            height: Number(match[4]),
+          });
+        }
+      );
+    });
+
+    this._windowBounds = { pid, bounds, at: Date.now() };
+    return bounds;
   }
 
   /**
@@ -125,6 +434,7 @@ class TextEditMonitor extends EventEmitter {
 
     this.process = spawn(command, args, {
       stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true,
     });
 
     // Send original text via stdin
@@ -236,26 +546,6 @@ class TextEditMonitor extends EventEmitter {
   }
 
   /**
-   * macOS: tell the target app that an assistive technology is present.
-   * This causes Chromium/Electron apps to build their accessibility tree.
-   */
-  _enableAccessibility(pid) {
-    return new Promise((resolve) => {
-      const script = MACOS_AX_ENABLE_SCRIPT(pid);
-      execFile("osascript", ["-e", script], { timeout: 3000 }, (err) => {
-        if (err) {
-          debugLogger.debug("[TextEditMonitor] macOS: AXEnhancedUserInterface failed", {
-            error: err.message,
-          });
-        } else {
-          debugLogger.debug("[TextEditMonitor] macOS: AXEnhancedUserInterface enabled", { pid });
-        }
-        resolve();
-      });
-    });
-  }
-
-  /**
    * macOS: use the native Swift AXObserver binary for event-based text monitoring.
    * Falls back to osascript polling if the binary fails to start.
    */
@@ -266,13 +556,21 @@ class TextEditMonitor extends EventEmitter {
       return;
     }
 
+    // The native monitor for these apps always burns its retries and ends in
+    // NO_ELEMENT -> stopMonitoring; skip the doomed child process entirely.
+    if (this._nativeSelectionUnsupportedPids.has(targetPid)) {
+      debugLogger.debug(
+        "[TextEditMonitor] macOS native: AX reads unsupported for target this session, skipping monitor",
+        { targetPid }
+      );
+      this.stopMonitoring();
+      return;
+    }
+
     debugLogger.debug("[TextEditMonitor] macOS native: starting", {
       targetPid,
       textPreview: originalText.substring(0, 80),
     });
-
-    await this._enableAccessibility(targetPid);
-    if (this.currentOriginalText === null) return;
 
     await new Promise((r) => setTimeout(r, INITIAL_QUERY_DELAY_MS));
     if (this.currentOriginalText === null) return;
@@ -290,8 +588,12 @@ class TextEditMonitor extends EventEmitter {
       return;
     }
 
+    // Per-child verdict state, so overlapping monitor runs can never cache
+    // each other's target.
+    const axRun = { stderr: "", noElement: false };
     this.process = spawn(command, [...args, String(targetPid)], {
       stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true,
     });
 
     this.process.stdin.write(originalText + "\n");
@@ -301,12 +603,14 @@ class TextEditMonitor extends EventEmitter {
     this.process.stdout.setEncoding("utf8");
     this.process.stdout.on("data", (chunk) => {
       debugLogger.debug("[TextEditMonitor] stdout", { data: chunk.trim() });
+      if (chunk.includes("NO_ELEMENT")) axRun.noElement = true;
       this._handleProcessStdoutChunk(chunk);
     });
 
     this.process.stderr.setEncoding("utf8");
     this.process.stderr.on("data", (data) => {
       debugLogger.debug("[TextEditMonitor] stderr", { data: data.trim() });
+      axRun.stderr += data;
     });
 
     this.process.on("error", (err) => {
@@ -321,6 +625,16 @@ class TextEditMonitor extends EventEmitter {
     this.process.on("exit", (code, signal) => {
       debugLogger.debug("[TextEditMonitor] Process exited", { code, signal });
       this.process = null;
+    });
+
+    // "close" fires after both stdio streams have flushed. The monitor child
+    // runs the full retry ladder with no exec timeout, so NO_ELEMENT after a
+    // uniform -25212 run is a terminal verdict — teach the cache so plain
+    // dictation stops spawning doomed monitors.
+    this.process.on("close", () => {
+      if (axRun.noElement && isPersistentAxNoValueFailure(axRun.stderr)) {
+        this._nativeSelectionUnsupportedPids.add(targetPid);
+      }
     });
 
     this.timeout = setTimeout(() => this.stopMonitoring(), timeoutMs);
@@ -362,15 +676,11 @@ class TextEditMonitor extends EventEmitter {
       textPreview: originalText.substring(0, 80),
     });
 
-    // Enable accessibility on the target app first (needed for Chromium/Electron apps),
-    // then delay before querying to let the paste keystroke be processed.
-    this._enableAccessibility(targetPid).then(() => {
-      if (this.currentOriginalText === null) return; // guard against stopMonitoring()
-      setTimeout(
-        () => this._queryInitialValue(targetPid, originalText, timeoutMs),
-        INITIAL_QUERY_DELAY_MS
-      );
-    });
+    // Delay before querying to let the paste keystroke be processed.
+    setTimeout(
+      () => this._queryInitialValue(targetPid, originalText, timeoutMs),
+      INITIAL_QUERY_DELAY_MS
+    );
   }
 
   /**

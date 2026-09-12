@@ -2,6 +2,7 @@ const fs = require("fs");
 const os = require("os");
 const { spawnSync } = require("child_process");
 const { dialog } = require("electron");
+const { getLinuxSessionInfo } = require("./linuxSession");
 
 function getLogger() {
   return require("./debugLogger");
@@ -136,7 +137,7 @@ async function ensureYdotool() {
   }
   if (!hasYdotoold) {
     missing.push(
-      "- ydotoold (daemon) is not installed. On Ubuntu/Pop!_OS: sudo apt install ydotoold"
+      "- ydotoold (daemon) is not installed. On Ubuntu/Pop!_OS: sudo apt install ydotoold. On Arch: included in the ydotool package."
     );
   }
   if (!hasUinput) {
@@ -173,29 +174,41 @@ async function ensureYdotool() {
   }
 }
 
+function isNixOS() {
+  try {
+    if (fs.existsSync("/etc/NIXOS")) return true;
+    const osRelease = fs.readFileSync("/etc/os-release", "utf8");
+    return /^ID=("?)nixos\1$/m.test(osRelease);
+  } catch {
+    return false;
+  }
+}
+
 function getYdotoolStatus() {
   const hasYdotool = commandExists("ydotool");
   const hasYdotoold = commandExists("ydotoold");
+  const hasWtype = commandExists("wtype");
   const daemonRunning = isYdotooldRunning();
   const hasService = serviceFileExists();
   const hasUinput = isUinputAccessible();
   const hasUdevRule = udevRuleExists();
   const hasGroup = userInInputGroup();
-  const isWayland =
-    (process.env.XDG_SESSION_TYPE || "").toLowerCase() === "wayland" ||
-    !!process.env.WAYLAND_DISPLAY;
+  const { isWayland, isKde, isWlroots } = getLinuxSessionInfo();
 
   return {
     isLinux: process.platform === "linux",
     isWayland,
+    isKde,
+    isWlroots,
     hasYdotool,
     hasYdotoold,
+    hasWtype,
     daemonRunning,
     hasService,
     hasUinput,
     hasUdevRule,
     hasGroup,
-    allGood: hasYdotool && hasYdotoold && daemonRunning && hasUinput && hasGroup,
+    isNixOS: isNixOS(),
   };
 }
 

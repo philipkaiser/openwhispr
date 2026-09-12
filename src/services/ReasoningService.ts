@@ -1,195 +1,191 @@
-import { getModelProvider, getCloudModel, getOpenAiApiConfig } from "../models/ModelRegistry";
+import {
+  resolveInferenceProvider,
+  getCloudModel,
+  getOpenAiApiConfig,
+  getProviderDisplayName,
+  isEnterpriseProvider,
+  type EnterpriseProvider,
+} from "../models/ModelRegistry";
 import { BaseReasoningService, ReasoningConfig } from "./BaseReasoningService";
 import { SecureCache } from "../utils/SecureCache";
-import { withRetry, createApiRetryStrategy } from "../utils/retry";
-import { API_ENDPOINTS, TOKEN_LIMITS, buildApiUrl, normalizeBaseUrl } from "../config/constants";
+import { withRetry, createApiRetryStrategy, httpError } from "../utils/retry";
+import { API_ENDPOINTS, TOKEN_LIMITS, buildApiUrl, ensureV1Suffix } from "../config/constants";
 import logger from "../utils/logger";
-import { isSecureEndpoint } from "../utils/urlUtils";
-import { withSessionRefresh } from "../lib/neonAuth";
-import { getSettings, isCloudReasoningMode } from "../stores/settingsStore";
+import { getSettings, isCloudCleanupMode } from "../stores/settingsStore";
+import { wrapCleanupTranscript } from "../config/prompts";
+import { stripThinkingTags } from "../helpers/stripThinking.js";
+import { getLlmRequestTimeoutSeconds } from "../helpers/llmRequestTimeout.js";
+import { streamText, stepCountIs } from "ai";
+import { getAIModel } from "./ai/providers";
+import { createEnterpriseChatModel } from "./ai/enterpriseChatModel";
+import { getManagedScopeResolution } from "../stores/enterpriseIdentityStore";
+import type { InferenceScope } from "../config/inferenceScopes";
+import { PROVIDER_REGISTRY, type ProviderContext } from "./ai/inferenceProviders";
+import {
+  canBorrowCleanupCustomKey,
+  resolveConfiguredOpenAIBase,
+  resolveSelfHostedOpenAIBase,
+} from "./ai/openaiBase";
+import {
+  applyChatCompletionsParams,
+  fetchWithParamFallback,
+  isTruncatedFinishReason,
+} from "./ai/chatRequestBody";
+import { getModelFamilyConstraints } from "./ai/modelFamilyConstraints";
+import { detectEndpointDialect } from "./ai/thinkingSuppressionDialects";
+import { openCodeSessionHeaders } from "./ai/openCodeSession";
+import { createStreamingThinkFilter } from "./ai/streamingThinkFilter";
+import { extractApiErrorMessage } from "./ai/apiErrorMessage";
+import { clearTinfoilClientCache } from "./ai/tinfoilClient";
+import { resolveChatRoute } from "../helpers/chatRouting";
+import { assertAgentAllowedByPolicy, assertReasoningAllowedByPolicy } from "./reasoningPolicy";
+import type { InferenceMode } from "../types/electron";
+
+export type ToolMetadata = Record<string, unknown> | Array<Record<string, unknown>>;
+
+interface ToolExecutionResult {
+  data: string;
+  displayText: string;
+  metadata?: ToolMetadata;
+}
+
+const BYOK_STREAM_PROVIDERS = [
+  "openai",
+  "groq",
+  "gemini",
+  "anthropic",
+  "tinfoil",
+  "custom",
+  "openrouter",
+  "corti",
+] as const;
+
+type ByokStreamProvider = (typeof BYOK_STREAM_PROVIDERS)[number];
+
+function toByokStreamProvider(provider: string): ByokStreamProvider {
+  if (!(BYOK_STREAM_PROVIDERS as readonly string[]).includes(provider)) {
+    throw new Error(`Unsupported reasoning provider: ${provider}`);
+  }
+  return provider as ByokStreamProvider;
+}
+
+export type AgentStreamChunk =
+  | { type: "content"; text: string }
+  | { type: "tool_calls"; calls: Array<{ id: string; name: string; arguments: string }> }
+  | {
+      type: "tool_result";
+      callId: string;
+      toolName: string;
+      displayText: string;
+      metadata?: ToolMetadata;
+    }
+  | { type: "done"; finishReason?: string };
+
+function resolveLlmDispatchMode(
+  provider: string,
+  config: Pick<ReasoningConfig, "lanUrl">
+): InferenceMode {
+  if (config.lanUrl || provider === "lan") return "self-hosted";
+  if (provider === "openwhispr") return "openwhispr";
+  if (provider === "local") return "local";
+  if (isEnterpriseProvider(provider)) return "enterprise";
+  return "providers";
+}
+
+function assertAgentSessionAllowedByPolicy(provider: string, mode: InferenceMode): void {
+  assertAgentAllowedByPolicy();
+  assertReasoningAllowedByPolicy(provider, mode);
+}
+
+function logParamFallback(logEvent: string) {
+  return (details: { status: number; stripped: string[] }) =>
+    logger.logReasoning(logEvent, details);
+}
 
 class ReasoningService extends BaseReasoningService {
   private apiKeyCache: SecureCache<string>;
-  private openAiEndpointPreference = new Map<string, "responses" | "chat">();
-  private static readonly OPENAI_ENDPOINT_PREF_STORAGE_KEY = "openAiEndpointPreference";
+  private static readonly MAX_TOOL_STEPS = 20;
   private cacheCleanupStop: (() => void) | undefined;
+  private streamAbortController: AbortController | null = null;
+  private activeRequestControllers = new Set<AbortController>();
+  private activeCloudStream: { requestId: string; cancel: () => void } | null = null;
+  private cloudOperationGeneration = 0;
+  private requestCancellationGeneration = 0;
+
+  private readonly providerContext: ProviderContext;
 
   constructor() {
     super();
     this.apiKeyCache = new SecureCache();
     this.cacheCleanupStop = this.apiKeyCache.startAutoCleanup();
+    this.providerContext = {
+      getApiKey: (provider: string) =>
+        this.getApiKey(provider as Parameters<ReasoningService["getApiKey"]>[0]),
+      getSystemPrompt: this.getSystemPrompt.bind(this),
+      getCustomDictionary: this.getCustomDictionary.bind(this),
+      getPreferredLanguage: this.getPreferredLanguage.bind(this),
+      getUiLanguage: this.getUiLanguage.bind(this),
+      callChatCompletionsApi: this.callChatCompletionsApi.bind(this),
+      calculateMaxTokens: this.calculateMaxTokens.bind(this),
+    };
 
     if (typeof window !== "undefined") {
       window.addEventListener("beforeunload", () => this.destroy());
     }
   }
 
-  private getConfiguredOpenAIBase(): string {
-    if (typeof window === "undefined") {
-      return API_ENDPOINTS.OPENAI_BASE;
-    }
-
-    try {
-      const settings = getSettings();
-      const provider = settings.reasoningProvider || "";
-      const isCustomProvider = provider === "custom";
-
-      if (!isCustomProvider) {
-        logger.logReasoning("CUSTOM_REASONING_ENDPOINT_CHECK", {
-          hasCustomUrl: false,
-          provider,
-          reason: "Provider is not 'custom', using default OpenAI endpoint",
-          defaultEndpoint: API_ENDPOINTS.OPENAI_BASE,
-        });
-        return API_ENDPOINTS.OPENAI_BASE;
-      }
-
-      const stored = settings.cloudReasoningBaseUrl || "";
-      const trimmed = stored.trim();
-
-      if (!trimmed) {
-        logger.logReasoning("CUSTOM_REASONING_ENDPOINT_CHECK", {
-          hasCustomUrl: false,
-          provider,
-          usingDefault: true,
-          defaultEndpoint: API_ENDPOINTS.OPENAI_BASE,
-        });
-        return API_ENDPOINTS.OPENAI_BASE;
-      }
-
-      const normalized = normalizeBaseUrl(trimmed) || API_ENDPOINTS.OPENAI_BASE;
-
-      logger.logReasoning("CUSTOM_REASONING_ENDPOINT_CHECK", {
-        hasCustomUrl: true,
-        provider,
-        rawUrl: trimmed,
-        normalizedUrl: normalized,
-        defaultEndpoint: API_ENDPOINTS.OPENAI_BASE,
-      });
-
-      const knownNonOpenAIUrls = [
-        "api.groq.com",
-        "api.anthropic.com",
-        "generativelanguage.googleapis.com",
-      ];
-
-      const isKnownNonOpenAI = knownNonOpenAIUrls.some((url) => normalized.includes(url));
-      if (isKnownNonOpenAI) {
-        logger.logReasoning("OPENAI_BASE_REJECTED", {
-          reason: "Custom URL is a known non-OpenAI provider, using default OpenAI endpoint",
-          attempted: normalized,
-        });
-        return API_ENDPOINTS.OPENAI_BASE;
-      }
-
-      if (!isSecureEndpoint(normalized)) {
-        logger.logReasoning("OPENAI_BASE_REJECTED", {
-          reason: "HTTPS required (HTTP allowed for local network only)",
-          attempted: normalized,
-        });
-        return API_ENDPOINTS.OPENAI_BASE;
-      }
-
-      logger.logReasoning("CUSTOM_REASONING_ENDPOINT_RESOLVED", {
-        customEndpoint: normalized,
-        isCustom: true,
-        provider,
-      });
-
-      return normalized;
-    } catch (error) {
-      logger.logReasoning("CUSTOM_REASONING_ENDPOINT_ERROR", {
-        error: (error as Error).message,
-        fallbackTo: API_ENDPOINTS.OPENAI_BASE,
-      });
-      return API_ENDPOINTS.OPENAI_BASE;
-    }
+  private hasLanCleanupConfiguration(): boolean {
+    const settings = getSettings();
+    return settings.cleanupMode === "self-hosted" && !!settings.cleanupRemoteUrl?.trim();
   }
 
-  private getOpenAIEndpointCandidates(
-    base: string
-  ): Array<{ url: string; type: "responses" | "chat" }> {
-    const lower = base.toLowerCase();
-
-    if (lower.endsWith("/responses") || lower.endsWith("/chat/completions")) {
-      const type = lower.endsWith("/responses") ? "responses" : "chat";
-      return [{ url: base, type }];
+  // Managed enterprise access owns the route. Manual self-hosted and BYOK overrides are
+  // dropped so a leftover endpoint or key can never outrank the administrator's provider.
+  private resolveManagedScope<T extends ReasoningConfig, P extends string | undefined>(
+    model: string,
+    provider: P,
+    config: T,
+    fallbackScope: InferenceScope
+  ): { model: string; provider: P; config: T; isManaged: boolean } {
+    const inferenceScope = config.inferenceScope || fallbackScope;
+    const managed = getManagedScopeResolution(inferenceScope, getSettings().enterpriseSetupMode);
+    if (managed.kind === "error") {
+      throw Object.assign(new Error(managed.message), {
+        code: managed.code,
+        messageKey: managed.messageKey,
+      });
     }
-
-    const preference = this.getStoredOpenAiPreference(base);
-    if (preference === "chat") {
-      return [{ url: buildApiUrl(base, "/chat/completions"), type: "chat" }];
+    if (managed.kind !== "managed") {
+      return { model, provider, config: { ...config, inferenceScope }, isManaged: false };
     }
-
-    const candidates: Array<{ url: string; type: "responses" | "chat" }> = [
-      { url: buildApiUrl(base, "/responses"), type: "responses" },
-      { url: buildApiUrl(base, "/chat/completions"), type: "chat" },
-    ];
-
-    return candidates;
-  }
-
-  private getStoredOpenAiPreference(base: string): "responses" | "chat" | undefined {
-    if (this.openAiEndpointPreference.has(base)) {
-      return this.openAiEndpointPreference.get(base);
-    }
-
-    if (typeof window === "undefined" || !window.localStorage) {
-      return undefined;
-    }
-
-    try {
-      const raw = window.localStorage.getItem(ReasoningService.OPENAI_ENDPOINT_PREF_STORAGE_KEY);
-      if (!raw) {
-        return undefined;
-      }
-      const parsed = JSON.parse(raw);
-      if (typeof parsed !== "object" || parsed === null) {
-        return undefined;
-      }
-      const value = parsed[base];
-      if (value === "responses" || value === "chat") {
-        this.openAiEndpointPreference.set(base, value);
-        return value;
-      }
-    } catch {
-      return undefined;
-    }
-
-    return undefined;
-  }
-
-  private rememberOpenAiPreference(base: string, preference: "responses" | "chat"): void {
-    this.openAiEndpointPreference.set(base, preference);
-
-    if (typeof window === "undefined" || !window.localStorage) {
-      return;
-    }
-
-    try {
-      const raw = window.localStorage.getItem(ReasoningService.OPENAI_ENDPOINT_PREF_STORAGE_KEY);
-      const parsed = raw ? JSON.parse(raw) : {};
-      const data = typeof parsed === "object" && parsed !== null ? parsed : {};
-      data[base] = preference;
-      window.localStorage.setItem(
-        ReasoningService.OPENAI_ENDPOINT_PREF_STORAGE_KEY,
-        JSON.stringify(data)
-      );
-    } catch {}
+    return {
+      model: managed.model,
+      provider: managed.provider as P,
+      config: {
+        ...config,
+        inferenceScope,
+        provider: managed.provider,
+        lanUrl: undefined,
+        baseUrl: undefined,
+        customApiKey: undefined,
+      },
+      isManaged: true,
+    };
   }
 
   private async getApiKey(
-    provider: "openai" | "anthropic" | "gemini" | "groq" | "custom"
+    provider:
+      "openai" | "anthropic" | "gemini" | "groq" | "tinfoil" | "custom" | "openrouter" | "corti"
   ): Promise<string> {
     if (provider === "custom") {
       let customKey = "";
       try {
-        customKey = (await window.electronAPI?.getCustomReasoningKey?.()) || "";
+        customKey = (await window.electronAPI?.getCleanupCustomKey?.()) || "";
       } catch (err) {
         logger.logReasoning("CUSTOM_KEY_IPC_FALLBACK", { error: (err as Error)?.message });
       }
       if (!customKey || !customKey.trim()) {
-        customKey = getSettings().customReasoningApiKey || "";
+        customKey = getSettings().cleanupCustomApiKey || "";
       }
       const trimmedKey = customKey.trim();
 
@@ -217,6 +213,9 @@ class ReasoningService extends BaseReasoningService {
           anthropic: () => window.electronAPI.getAnthropicKey(),
           gemini: () => window.electronAPI.getGeminiKey(),
           groq: () => window.electronAPI.getGroqKey(),
+          openrouter: () => window.electronAPI.getOpenrouterKey(),
+          tinfoil: () => window.electronAPI.getTinfoilKey?.(),
+          corti: () => window.electronAPI.getCortiKey?.(),
         };
         apiKey = (await keyGetters[provider]()) ?? undefined;
 
@@ -239,15 +238,40 @@ class ReasoningService extends BaseReasoningService {
     }
 
     if (!apiKey) {
-      const errorMsg = `${provider.charAt(0).toUpperCase() + provider.slice(1)} API key not configured`;
+      const displayName = getProviderDisplayName(provider);
+      const errorMsg = `${displayName} API key not configured`;
       logger.logReasoning(`${provider.toUpperCase()}_KEY_MISSING`, {
         provider,
         error: errorMsg,
       });
-      throw new Error(errorMsg);
+      const error = new Error(errorMsg) as Error & { code: string; provider: string };
+      error.code = "API_KEY_MISSING";
+      error.provider = displayName;
+      throw error;
     }
 
     return apiKey;
+  }
+
+  // Single source for BYOK streaming credentials and endpoint overrides:
+  // rejects unknown providers instead of defaulting them to OpenAI, and only
+  // lets a custom scope borrow the shared cleanup key for the cleanup endpoint.
+  private async resolveByokAccess(
+    provider: string,
+    config: Pick<ReasoningConfig, "baseUrl" | "customApiKey">
+  ): Promise<{ apiKey: string; baseURL?: string }> {
+    const providerKey = toByokStreamProvider(provider);
+    const overrideKey = providerKey === "custom" ? config.customApiKey?.trim() || "" : "";
+    const canFallBackToSharedKey =
+      providerKey !== "custom" || canBorrowCleanupCustomKey(config.baseUrl);
+    const apiKey = overrideKey || (canFallBackToSharedKey ? await this.getApiKey(providerKey) : "");
+    const baseURL =
+      providerKey === "openrouter"
+        ? API_ENDPOINTS.OPENROUTER_BASE
+        : providerKey === "custom"
+          ? resolveConfiguredOpenAIBase(providerKey, config.baseUrl)
+          : undefined;
+    return { apiKey, baseURL };
   }
 
   private async callChatCompletionsApi(
@@ -259,19 +283,24 @@ class ReasoningService extends BaseReasoningService {
     config: ReasoningConfig,
     providerName: string
   ): Promise<string> {
-    const systemPrompt = config.systemPrompt || this.getSystemPrompt(agentName, text);
-    const userPrompt = text;
+    // No systemPrompt override means the default cleanup path: a deterministic
+    // transform, so zero temperature and a delimited transcript.
+    const isCleanup = !config.systemPrompt;
+    const systemPrompt = config.systemPrompt || this.getSystemPrompt(agentName);
+    const userPrompt = isCleanup ? wrapCleanupTranscript(text) : text;
 
     const messages = [
       { role: "system", content: systemPrompt },
       { role: "user", content: userPrompt },
     ];
 
-    const requestBody: any = {
+    const requestBody: any = { model, messages };
+    applyChatCompletionsParams(requestBody, {
       model,
-      messages,
-      temperature: config.temperature ?? 0.3,
-      max_tokens:
+      provider: providerName,
+      endpoint,
+      config,
+      maxTokens:
         config.maxTokens ||
         Math.max(
           4096,
@@ -282,13 +311,7 @@ class ReasoningService extends BaseReasoningService {
             TOKEN_LIMITS.TOKEN_MULTIPLIER
           )
         ),
-    };
-
-    // Disable thinking for Groq Qwen models
-    const modelDef = getCloudModel(model);
-    if (modelDef?.disableThinking && providerName.toLowerCase() === "groq") {
-      requestBody.reasoning_effort = "none";
-    }
+    });
 
     logger.logReasoning(`${providerName.toUpperCase()}_REQUEST`, {
       endpoint,
@@ -297,19 +320,38 @@ class ReasoningService extends BaseReasoningService {
       requestBody: JSON.stringify(requestBody).substring(0, 200),
     });
 
+    // Minted before the retry loop so every attempt of this call is one conversation.
+    const openCodeHeaders = openCodeSessionHeaders(endpoint);
+
+    const requestGeneration = this.requestCancellationGeneration;
     const response = await withRetry(async () => {
+      if (requestGeneration !== this.requestCancellationGeneration) {
+        throw httpError("Request cancelled", 499);
+      }
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 30000);
+      this.activeRequestControllers.add(controller);
+      const timeoutSeconds = getLlmRequestTimeoutSeconds();
+      const timeoutId = setTimeout(() => controller.abort(), timeoutSeconds * 1000);
       try {
-        const res = await fetch(endpoint, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${apiKey}`,
-          },
-          body: JSON.stringify(requestBody),
-          signal: controller.signal,
-        });
+        const headers: Record<string, string> = {
+          "Content-Type": "application/json",
+          ...openCodeHeaders,
+        };
+        if (apiKey) {
+          headers["Authorization"] = `Bearer ${apiKey}`;
+        }
+
+        const res = await fetchWithParamFallback(
+          () =>
+            fetch(endpoint, {
+              method: "POST",
+              headers,
+              body: JSON.stringify(requestBody),
+              signal: controller.signal,
+            }),
+          requestBody,
+          logParamFallback(`${providerName.toUpperCase()}_PARAM_FALLBACK`)
+        );
 
         if (!res.ok) {
           const errorText = await res.text();
@@ -321,20 +363,19 @@ class ReasoningService extends BaseReasoningService {
             errorData = { error: errorText || res.statusText };
           }
 
+          const errorMessage = extractApiErrorMessage(
+            errorData,
+            `${providerName} API error: ${res.status}`
+          );
+
           logger.logReasoning(`${providerName.toUpperCase()}_API_ERROR_DETAIL`, {
             status: res.status,
             statusText: res.statusText,
             error: errorData,
-            errorMessage: errorData.error?.message || errorData.message || errorData.error,
+            errorMessage,
             fullResponse: errorText.substring(0, 500),
           });
-
-          const errorMessage =
-            errorData.error?.message ||
-            errorData.message ||
-            errorData.error ||
-            `${providerName} API error: ${res.status}`;
-          throw new Error(errorMessage);
+          throw httpError(errorMessage, res.status);
         }
 
         const jsonResponse = await res.json();
@@ -350,11 +391,15 @@ class ReasoningService extends BaseReasoningService {
         return jsonResponse;
       } catch (error) {
         if ((error as Error).name === "AbortError") {
-          throw new Error("Request timed out after 30s");
+          if (requestGeneration !== this.requestCancellationGeneration) {
+            throw httpError("Request cancelled", 499);
+          }
+          throw new Error(`Request timed out after ${timeoutSeconds}s`);
         }
         throw error;
       } finally {
         clearTimeout(timeoutId);
+        this.activeRequestControllers.delete(controller);
       }
     }, createApiRetryStrategy());
 
@@ -369,7 +414,14 @@ class ReasoningService extends BaseReasoningService {
     }
 
     const choice = response.choices[0];
-    const responseText = choice.message?.content?.trim() || "";
+    if (config.requireCompleteOutput && isTruncatedFinishReason(choice?.finish_reason)) {
+      throw new Error("Model output was truncated before the selection edit completed");
+    }
+    // Reasoning models leak <think> blocks into non-streamed output; strip them
+    // unless the user explicitly enabled thinking (same default as streaming).
+    const rawContent = choice.message?.content?.trim() || "";
+    const responseText =
+      config.disableThinking !== false ? stripThinkingTags(rawContent) : rawContent;
 
     if (!responseText) {
       logger.logReasoning(`${providerName.toUpperCase()}_EMPTY_RESPONSE`, {
@@ -397,707 +449,82 @@ class ReasoningService extends BaseReasoningService {
     agentName: string | null = null,
     config: ReasoningConfig = {}
   ): Promise<string> {
-    let trimmedModel = model?.trim?.() || "";
-    const provider = getModelProvider(trimmedModel);
+    const managed = this.resolveManagedScope(model, config.provider, config, "dictationCleanup");
+    ({ model, config } = managed);
+    const trimmedModel = model?.trim?.() || "";
+    const settings = getSettings();
+    const isImplicitCleanup =
+      config.provider === undefined && config.baseUrl === undefined && config.lanUrl === undefined;
+    const implicitProvider =
+      settings.cleanupMode === "openwhispr"
+        ? "openwhispr"
+        : settings.cleanupMode === "self-hosted"
+          ? "lan"
+          : settings.cleanupProvider || undefined;
+    const isImplicitCustomCleanup =
+      isImplicitCleanup && settings.cleanupMode === "providers" && implicitProvider === "custom";
+    const dispatchConfig: ReasoningConfig = isImplicitCleanup
+      ? {
+          ...config,
+          provider: implicitProvider,
+          baseUrl: isImplicitCustomCleanup ? settings.cleanupCloudBaseUrl : undefined,
+          customApiKey: isImplicitCustomCleanup
+            ? (config.customApiKey ?? settings.cleanupCustomApiKey)
+            : config.customApiKey,
+        }
+      : config;
+    const isLanCleanup = !!dispatchConfig.lanUrl || dispatchConfig.provider === "lan";
+    const providerId = isLanCleanup
+      ? "lan"
+      : resolveInferenceProvider(dispatchConfig.provider, trimmedModel);
+    if (!providerId) {
+      throw new Error("No reasoning provider selected");
+    }
+    if (dispatchConfig.requiresAgent) assertAgentAllowedByPolicy();
+    assertReasoningAllowedByPolicy(providerId, resolveLlmDispatchMode(providerId, dispatchConfig));
 
-    if (!trimmedModel && provider !== "openwhispr") {
+    if (!trimmedModel && providerId !== "openwhispr" && providerId !== "lan") {
       throw new Error("No reasoning model selected");
     }
 
     logger.logReasoning("PROVIDER_SELECTION", {
+      provider: providerId,
       model: trimmedModel,
-      provider,
       agentName,
-      hasConfig: Object.keys(config).length > 0,
+      isLanCleanup,
       textLength: text.length,
-      timestamp: new Date().toISOString(),
     });
 
-    try {
-      let result: string;
-      const startTime = Date.now();
+    const handler = PROVIDER_REGISTRY[providerId];
+    if (!handler) {
+      throw new Error(`Unsupported reasoning provider: ${providerId}`);
+    }
 
-      logger.logReasoning("ROUTING_TO_PROVIDER", {
-        provider,
-        model,
+    const startTime = Date.now();
+    try {
+      const result = await handler.call({
+        text,
+        model: trimmedModel,
+        agentName,
+        config: dispatchConfig,
+        ctx: this.providerContext,
       });
 
-      switch (provider) {
-        case "openai":
-          result = await this.processWithOpenAI(text, trimmedModel, agentName, config);
-          break;
-        case "anthropic":
-          result = await this.processWithAnthropic(text, trimmedModel, agentName, config);
-          break;
-        case "local":
-          result = await this.processWithLocal(text, trimmedModel, agentName, config);
-          break;
-        case "gemini":
-          result = await this.processWithGemini(text, trimmedModel, agentName, config);
-          break;
-        case "groq":
-          result = await this.processWithGroq(text, model, agentName, config);
-          break;
-        case "openwhispr":
-          result = await this.processWithOpenWhispr(text, model, agentName, config);
-          break;
-        case "custom":
-          result = await this.processWithOpenAI(text, trimmedModel, agentName, config);
-          break;
-        default:
-          throw new Error(`Unsupported reasoning provider: ${provider}`);
-      }
-
-      const processingTime = Date.now() - startTime;
-
       logger.logReasoning("PROVIDER_SUCCESS", {
-        provider,
-        model,
-        processingTimeMs: processingTime,
+        provider: providerId,
+        model: trimmedModel,
+        processingTimeMs: Date.now() - startTime,
         resultLength: result.length,
-        resultPreview: result.substring(0, 100) + (result.length > 100 ? "..." : ""),
       });
 
       return result;
     } catch (error) {
       logger.logReasoning("PROVIDER_ERROR", {
-        provider,
-        model,
-        error: (error as Error).message,
-        stack: (error as Error).stack,
-      });
-      throw error;
-    }
-  }
-
-  private async processWithOpenAI(
-    text: string,
-    model: string,
-    agentName: string | null = null,
-    config: ReasoningConfig = {}
-  ): Promise<string> {
-    const reasoningProvider = getSettings().reasoningProvider || "";
-    const isCustomProvider = reasoningProvider === "custom";
-
-    logger.logReasoning("OPENAI_START", {
-      model,
-      agentName,
-      isCustomProvider,
-      hasApiKey: false, // Will update after fetching
-    });
-
-    if (this.isProcessing) {
-      throw new Error("Already processing a request");
-    }
-
-    const apiKey = await this.getApiKey(isCustomProvider ? "custom" : "openai");
-
-    logger.logReasoning("OPENAI_API_KEY", {
-      hasApiKey: !!apiKey,
-      keyLength: apiKey?.length || 0,
-    });
-
-    this.isProcessing = true;
-
-    try {
-      const systemPrompt = config.systemPrompt || this.getSystemPrompt(agentName, text);
-      const userPrompt = text;
-
-      const messages = [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userPrompt },
-      ];
-
-      const openAiBase = this.getConfiguredOpenAIBase();
-      const endpointCandidates = this.getOpenAIEndpointCandidates(openAiBase);
-      const isCustomEndpoint = openAiBase !== API_ENDPOINTS.OPENAI_BASE;
-
-      logger.logReasoning("OPENAI_ENDPOINTS", {
-        base: openAiBase,
-        isCustomEndpoint,
-        candidates: endpointCandidates.map((candidate) => candidate.url),
-        preference: this.getStoredOpenAiPreference(openAiBase) || null,
-      });
-
-      if (isCustomEndpoint) {
-        logger.logReasoning("CUSTOM_TEXT_CLEANUP_REQUEST", {
-          customBase: openAiBase,
-          model,
-          textLength: text.length,
-          hasApiKey: !!apiKey,
-          apiKeyPreview: apiKey ? `${apiKey.substring(0, 8)}...` : "(none)",
-        });
-      }
-
-      const response = await withRetry(async () => {
-        let lastError: Error | null = null;
-
-        for (const { url: endpoint, type } of endpointCandidates) {
-          const controller = new AbortController();
-          const timeoutId = setTimeout(() => controller.abort(), 30000);
-          try {
-            const maxTokens =
-              config.maxTokens ||
-              Math.max(
-                4096,
-                this.calculateMaxTokens(
-                  text.length,
-                  TOKEN_LIMITS.MIN_TOKENS,
-                  TOKEN_LIMITS.MAX_TOKENS,
-                  TOKEN_LIMITS.TOKEN_MULTIPLIER
-                )
-              );
-
-            const apiConfig = getOpenAiApiConfig(model);
-            const requestBody: any = { model };
-
-            if (type === "responses") {
-              requestBody.input = messages;
-              requestBody.store = false;
-              requestBody.max_output_tokens = maxTokens;
-            } else {
-              requestBody.messages = messages;
-              requestBody[apiConfig.tokenParam] = maxTokens;
-            }
-
-            if (apiConfig.supportsTemperature) {
-              requestBody.temperature = config.temperature || 0.3;
-            }
-
-            const res = await fetch(endpoint, {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-                Authorization: `Bearer ${apiKey}`,
-              },
-              body: JSON.stringify(requestBody),
-              signal: controller.signal,
-            });
-
-            if (!res.ok) {
-              const errorData = await res.json().catch(() => ({ error: res.statusText }));
-              const errorMessage =
-                errorData.error?.message || errorData.message || `OpenAI API error: ${res.status}`;
-
-              const isUnsupportedEndpoint =
-                (res.status === 404 || res.status === 405) && type === "responses";
-
-              if (isUnsupportedEndpoint) {
-                lastError = new Error(errorMessage);
-                this.rememberOpenAiPreference(openAiBase, "chat");
-                logger.logReasoning("OPENAI_ENDPOINT_FALLBACK", {
-                  attemptedEndpoint: endpoint,
-                  error: errorMessage,
-                });
-                continue;
-              }
-
-              throw new Error(errorMessage);
-            }
-
-            this.rememberOpenAiPreference(openAiBase, type);
-            return res.json();
-          } catch (error) {
-            if ((error as Error).name === "AbortError") {
-              throw new Error("Request timed out after 30s");
-            }
-            lastError = error as Error;
-            if (type === "responses") {
-              logger.logReasoning("OPENAI_ENDPOINT_FALLBACK", {
-                attemptedEndpoint: endpoint,
-                error: (error as Error).message,
-              });
-              continue;
-            }
-            throw error;
-          } finally {
-            clearTimeout(timeoutId);
-          }
-        }
-
-        throw lastError || new Error("No OpenAI endpoint responded");
-      }, createApiRetryStrategy());
-
-      const isResponsesApi = Array.isArray(response?.output);
-      const isChatCompletions = Array.isArray(response?.choices);
-
-      logger.logReasoning("OPENAI_RAW_RESPONSE", {
-        model,
-        format: isResponsesApi ? "responses" : isChatCompletions ? "chat_completions" : "unknown",
-        hasOutput: isResponsesApi,
-        outputLength: isResponsesApi ? response.output.length : 0,
-        outputTypes: isResponsesApi ? response.output.map((item: any) => item.type) : undefined,
-        hasChoices: isChatCompletions,
-        choicesLength: isChatCompletions ? response.choices.length : 0,
-        usage: response.usage,
-      });
-
-      let responseText = "";
-
-      if (isResponsesApi) {
-        for (const item of response.output) {
-          if (item.type === "message" && item.content) {
-            for (const content of item.content) {
-              if (content.type === "output_text" && content.text) {
-                responseText = content.text.trim();
-                break;
-              }
-            }
-            if (responseText) break;
-          }
-        }
-      }
-
-      if (!responseText && typeof response?.output_text === "string") {
-        responseText = response.output_text.trim();
-      }
-
-      if (!responseText && isChatCompletions) {
-        for (const choice of response.choices) {
-          const message = choice?.message ?? choice?.delta;
-          const content = message?.content;
-
-          if (typeof content === "string" && content.trim()) {
-            responseText = content.trim();
-            break;
-          }
-
-          if (Array.isArray(content)) {
-            for (const part of content) {
-              if (typeof part?.text === "string" && part.text.trim()) {
-                responseText = part.text.trim();
-                break;
-              }
-            }
-          }
-
-          if (responseText) break;
-
-          if (typeof choice?.text === "string" && choice.text.trim()) {
-            responseText = choice.text.trim();
-            break;
-          }
-        }
-      }
-
-      logger.logReasoning("OPENAI_RESPONSE", {
-        model,
-        responseLength: responseText.length,
-        tokensUsed: response.usage?.total_tokens || 0,
-        success: true,
-        isEmpty: responseText.length === 0,
-      });
-
-      if (!responseText) {
-        logger.logReasoning("OPENAI_EMPTY_RESPONSE_FALLBACK", {
-          model,
-          originalTextLength: text.length,
-          reason: "Empty response from API",
-        });
-        return text;
-      }
-
-      return responseText;
-    } catch (error) {
-      logger.logReasoning("OPENAI_ERROR", {
-        model,
-        error: (error as Error).message,
-        errorType: (error as Error).name,
-      });
-      throw error;
-    } finally {
-      this.isProcessing = false;
-    }
-  }
-
-  private async processWithAnthropic(
-    text: string,
-    model: string,
-    agentName: string | null = null,
-    config: ReasoningConfig = {}
-  ): Promise<string> {
-    logger.logReasoning("ANTHROPIC_START", {
-      model,
-      agentName,
-      environment: typeof window !== "undefined" ? "browser" : "node",
-    });
-
-    if (typeof window !== "undefined" && window.electronAPI) {
-      const startTime = Date.now();
-
-      logger.logReasoning("ANTHROPIC_IPC_CALL", {
-        model,
-        textLength: text.length,
-      });
-
-      const systemPrompt = config.systemPrompt || this.getSystemPrompt(agentName, text);
-      const result = await window.electronAPI.processAnthropicReasoning(text, model, agentName, {
-        ...config,
-        systemPrompt,
-      });
-
-      const processingTime = Date.now() - startTime;
-
-      if (result.success) {
-        logger.logReasoning("ANTHROPIC_SUCCESS", {
-          model,
-          processingTimeMs: processingTime,
-          resultLength: result.text.length,
-        });
-        return result.text;
-      } else {
-        logger.logReasoning("ANTHROPIC_ERROR", {
-          model,
-          processingTimeMs: processingTime,
-          error: result.error,
-        });
-        throw new Error(result.error);
-      }
-    } else {
-      logger.logReasoning("ANTHROPIC_UNAVAILABLE", {
-        reason: "Not in Electron environment",
-      });
-      throw new Error("Anthropic reasoning is not available in this environment");
-    }
-  }
-
-  private async processWithLocal(
-    text: string,
-    model: string,
-    agentName: string | null = null,
-    config: ReasoningConfig = {}
-  ): Promise<string> {
-    logger.logReasoning("LOCAL_START", {
-      model,
-      agentName,
-      environment: typeof window !== "undefined" ? "browser" : "node",
-    });
-
-    if (typeof window !== "undefined" && window.electronAPI) {
-      const startTime = Date.now();
-
-      logger.logReasoning("LOCAL_IPC_CALL", {
-        model,
-        textLength: text.length,
-      });
-
-      const systemPrompt = config.systemPrompt || this.getSystemPrompt(agentName, text);
-      const result = await window.electronAPI.processLocalReasoning(text, model, agentName, {
-        ...config,
-        systemPrompt,
-      });
-
-      const processingTime = Date.now() - startTime;
-
-      if (result.success) {
-        logger.logReasoning("LOCAL_SUCCESS", {
-          model,
-          processingTimeMs: processingTime,
-          resultLength: result.text.length,
-        });
-        return result.text;
-      } else {
-        logger.logReasoning("LOCAL_ERROR", {
-          model,
-          processingTimeMs: processingTime,
-          error: result.error,
-        });
-        throw new Error(result.error);
-      }
-    } else {
-      logger.logReasoning("LOCAL_UNAVAILABLE", {
-        reason: "Not in Electron environment",
-      });
-      throw new Error("Local reasoning is not available in this environment");
-    }
-  }
-
-  private async processWithGemini(
-    text: string,
-    model: string,
-    agentName: string | null = null,
-    config: ReasoningConfig = {}
-  ): Promise<string> {
-    logger.logReasoning("GEMINI_START", {
-      model,
-      agentName,
-      hasApiKey: false,
-    });
-
-    if (this.isProcessing) {
-      throw new Error("Already processing a request");
-    }
-
-    const apiKey = await this.getApiKey("gemini");
-
-    logger.logReasoning("GEMINI_API_KEY", {
-      hasApiKey: !!apiKey,
-      keyLength: apiKey?.length || 0,
-    });
-
-    this.isProcessing = true;
-
-    try {
-      const systemPrompt = config.systemPrompt || this.getSystemPrompt(agentName, text);
-      const userPrompt = text;
-
-      const requestBody = {
-        contents: [
-          {
-            parts: [
-              {
-                text: `${systemPrompt}\n\n${userPrompt}`,
-              },
-            ],
-          },
-        ],
-        generationConfig: {
-          temperature: config.temperature || 0.3,
-          maxOutputTokens:
-            config.maxTokens ||
-            Math.max(
-              2000,
-              this.calculateMaxTokens(
-                text.length,
-                TOKEN_LIMITS.MIN_TOKENS_GEMINI,
-                TOKEN_LIMITS.MAX_TOKENS_GEMINI,
-                TOKEN_LIMITS.TOKEN_MULTIPLIER
-              )
-            ),
-        },
-      };
-
-      let response: any;
-      try {
-        response = await withRetry(async () => {
-          logger.logReasoning("GEMINI_REQUEST", {
-            endpoint: `${API_ENDPOINTS.GEMINI}/models/${model}:generateContent`,
-            model,
-            hasApiKey: !!apiKey,
-            requestBody: JSON.stringify(requestBody).substring(0, 200),
-          });
-
-          const controller = new AbortController();
-          const timeoutId = setTimeout(() => controller.abort(), 30000);
-          try {
-            const res = await fetch(`${API_ENDPOINTS.GEMINI}/models/${model}:generateContent`, {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-                "x-goog-api-key": apiKey,
-              },
-              body: JSON.stringify(requestBody),
-              signal: controller.signal,
-            });
-
-            if (!res.ok) {
-              const errorText = await res.text();
-              let errorData: any = { error: res.statusText };
-
-              try {
-                errorData = JSON.parse(errorText);
-              } catch {
-                errorData = { error: errorText || res.statusText };
-              }
-
-              logger.logReasoning("GEMINI_API_ERROR_DETAIL", {
-                status: res.status,
-                statusText: res.statusText,
-                error: errorData,
-                errorMessage: errorData.error?.message || errorData.message || errorData.error,
-                fullResponse: errorText.substring(0, 500),
-              });
-
-              const errorMessage =
-                errorData.error?.message ||
-                errorData.message ||
-                errorData.error ||
-                `Gemini API error: ${res.status}`;
-              throw new Error(errorMessage);
-            }
-
-            const jsonResponse = await res.json();
-
-            logger.logReasoning("GEMINI_RAW_RESPONSE", {
-              hasResponse: !!jsonResponse,
-              responseKeys: jsonResponse ? Object.keys(jsonResponse) : [],
-              hasCandidates: !!jsonResponse?.candidates,
-              candidatesLength: jsonResponse?.candidates?.length || 0,
-              fullResponse: JSON.stringify(jsonResponse).substring(0, 500),
-            });
-
-            return jsonResponse;
-          } catch (error) {
-            if ((error as Error).name === "AbortError") {
-              throw new Error("Request timed out after 30s");
-            }
-            throw error;
-          } finally {
-            clearTimeout(timeoutId);
-          }
-        }, createApiRetryStrategy());
-      } catch (fetchError) {
-        logger.logReasoning("GEMINI_FETCH_ERROR", {
-          error: (fetchError as Error).message,
-          stack: (fetchError as Error).stack,
-        });
-        throw fetchError;
-      }
-
-      if (!response.candidates || !response.candidates[0]) {
-        logger.logReasoning("GEMINI_RESPONSE_ERROR", {
-          model,
-          response: JSON.stringify(response).substring(0, 500),
-          hasCandidate: !!response.candidates,
-          candidateCount: response.candidates?.length || 0,
-        });
-        throw new Error("Invalid response structure from Gemini API");
-      }
-
-      const candidate = response.candidates[0];
-      if (!candidate.content?.parts?.[0]?.text) {
-        logger.logReasoning("GEMINI_EMPTY_RESPONSE", {
-          model,
-          finishReason: candidate.finishReason,
-          hasContent: !!candidate.content,
-          hasParts: !!candidate.content?.parts,
-          response: JSON.stringify(candidate).substring(0, 500),
-        });
-
-        if (candidate.finishReason === "MAX_TOKENS") {
-          throw new Error(
-            "Gemini reached token limit before generating response. Try a shorter input or increase max tokens."
-          );
-        }
-        throw new Error("Gemini returned empty response");
-      }
-
-      const responseText = candidate.content.parts[0].text.trim();
-
-      logger.logReasoning("GEMINI_RESPONSE", {
-        model,
-        responseLength: responseText.length,
-        tokensUsed: response.usageMetadata?.totalTokenCount || 0,
-        success: true,
-      });
-
-      return responseText;
-    } catch (error) {
-      logger.logReasoning("GEMINI_ERROR", {
-        model,
-        error: (error as Error).message,
-        errorType: (error as Error).name,
-      });
-      throw error;
-    } finally {
-      this.isProcessing = false;
-    }
-  }
-
-  private async processWithGroq(
-    text: string,
-    model: string,
-    agentName: string | null = null,
-    config: ReasoningConfig = {}
-  ): Promise<string> {
-    logger.logReasoning("GROQ_START", { model, agentName });
-
-    if (this.isProcessing) {
-      throw new Error("Already processing a request");
-    }
-
-    const apiKey = await this.getApiKey("groq");
-    this.isProcessing = true;
-
-    try {
-      const endpoint = buildApiUrl(API_ENDPOINTS.GROQ_BASE, "/chat/completions");
-      return await this.callChatCompletionsApi(
-        endpoint,
-        apiKey,
-        model,
-        text,
-        agentName,
-        config,
-        "Groq"
-      );
-    } catch (error) {
-      logger.logReasoning("GROQ_ERROR", {
-        model,
-        error: (error as Error).message,
-        errorType: (error as Error).name,
-      });
-      throw error;
-    } finally {
-      this.isProcessing = false;
-    }
-  }
-
-  private async processWithOpenWhispr(
-    text: string,
-    model: string,
-    agentName: string | null = null,
-    config: ReasoningConfig = {}
-  ): Promise<string> {
-    logger.logReasoning("OPENWHISPR_START", { model, agentName });
-
-    if (this.isProcessing) {
-      throw new Error("Already processing a request");
-    }
-
-    this.isProcessing = true;
-
-    try {
-      const customDictionary = this.getCustomDictionary();
-      const language = this.getPreferredLanguage();
-      const locale = this.getUiLanguage();
-
-      const result = await withSessionRefresh(async () => {
-        const res = await window.electronAPI?.cloudReason?.(text, {
-          agentName,
-          customDictionary,
-          customPrompt: this.getCustomPrompt(),
-          systemPrompt: config.systemPrompt,
-          language,
-          locale,
-        });
-
-        if (!res?.success) {
-          const err: any = new Error(res?.error || "OpenWhispr cloud reasoning failed");
-          err.code = res?.code;
-          throw err;
-        }
-
-        return res;
-      });
-
-      logger.logReasoning("OPENWHISPR_SUCCESS", {
-        model: result.model,
-        provider: result.provider,
-        resultLength: result.text.length,
-        promptMode: result.promptMode,
-        matchType: result.matchType,
-      });
-
-      return result.text;
-    } catch (error) {
-      logger.logReasoning("OPENWHISPR_ERROR", {
-        model,
+        provider: providerId,
+        model: trimmedModel,
         error: (error as Error).message,
       });
       throw error;
-    } finally {
-      this.isProcessing = false;
-    }
-  }
-
-  private getCustomPrompt(): string | undefined {
-    try {
-      const raw = localStorage.getItem("customUnifiedPrompt");
-      if (!raw) return undefined;
-      const parsed = JSON.parse(raw);
-      return typeof parsed === "string" ? parsed : undefined;
-    } catch {
-      return undefined;
     }
   }
 
@@ -1107,42 +534,72 @@ class ReasoningService extends BaseReasoningService {
     provider: string,
     config: ReasoningConfig & { systemPrompt: string }
   ): AsyncGenerator<string, void, unknown> {
-    const cloudProviders = ["openai", "groq", "gemini", "anthropic", "custom"];
-    const isLocalProvider = !cloudProviders.includes(provider);
+    const abortController = new AbortController();
+    this.streamAbortController = abortController;
+    try {
+      yield* this.processTextStreamingRaw(messages, model, provider, config, abortController);
+    } finally {
+      if (this.streamAbortController === abortController) {
+        this.streamAbortController = null;
+      }
+    }
+  }
+
+  private async *processTextStreamingRaw(
+    messages: Array<{ role: string; content: string }>,
+    model: string,
+    provider: string,
+    config: ReasoningConfig & { systemPrompt: string },
+    abortController: AbortController
+  ): AsyncGenerator<string, void, unknown> {
+    const route = resolveChatRoute({
+      provider,
+      lanUrl: config.lanUrl,
+      customApiKey: config.customApiKey,
+    });
+    const mode: InferenceMode =
+      route.kind === "self-hosted" ? "self-hosted" : route.kind === "local" ? "local" : "providers";
+    assertAgentSessionAllowedByPolicy(provider, mode);
+    const isLocalProvider = route.kind === "local";
+    const isLanChat = route.kind === "self-hosted";
 
     let endpoint: string;
     let apiKey = "";
 
-    if (isLocalProvider) {
-      // Local model via llama.cpp server
+    if (isLanChat) {
+      const baseUrl = resolveSelfHostedOpenAIBase(route.baseUrl);
+      endpoint = buildApiUrl(baseUrl, "/chat/completions");
+      apiKey = route.apiKey;
+    } else if (isLocalProvider) {
       const serverResult = await window.electronAPI.llamaServerStart(model);
       if (!serverResult.success || !serverResult.port) {
         throw new Error(serverResult.error || "Failed to start local model server");
       }
       endpoint = `http://127.0.0.1:${serverResult.port}/v1/chat/completions`;
     } else {
-      const providerKey = provider as "openai" | "groq" | "gemini" | "anthropic" | "custom";
-      apiKey = await this.getApiKey(providerKey);
-
-      switch (providerKey) {
-        case "groq":
-          endpoint = buildApiUrl(API_ENDPOINTS.GROQ_BASE, "/chat/completions");
-          break;
-        case "gemini":
-          endpoint = buildApiUrl(API_ENDPOINTS.GEMINI, "/openai/chat/completions");
-          break;
-        case "openai":
-        case "custom":
-          endpoint = buildApiUrl(this.getConfiguredOpenAIBase(), "/chat/completions");
-          break;
-        default:
-          endpoint = buildApiUrl(API_ENDPOINTS.OPENAI_BASE, "/chat/completions");
-          break;
+      const access = await this.resolveByokAccess(provider, config);
+      apiKey = access.apiKey;
+      const chatBase =
+        access.baseURL ??
+        (
+          {
+            openai: API_ENDPOINTS.OPENAI_BASE,
+            groq: API_ENDPOINTS.GROQ_BASE,
+            corti: API_ENDPOINTS.CORTI_MODELS_BASE,
+            gemini: API_ENDPOINTS.GEMINI,
+          } as Partial<Record<string, string>>
+        )[provider];
+      // anthropic and tinfoil have no raw Chat Completions transport here.
+      if (!chatBase) {
+        throw new Error(`${provider} streaming must use the AI SDK transport`);
       }
+      endpoint = buildApiUrl(
+        chatBase,
+        provider === "gemini" ? "/openai/chat/completions" : "/chat/completions"
+      );
     }
 
-    const apiConfig = getOpenAiApiConfig(model);
-    const useOldTokenParam = isLocalProvider || provider === "groq";
+    if (abortController.signal.aborted) return;
 
     const requestBody: Record<string, unknown> = {
       model,
@@ -1150,49 +607,68 @@ class ReasoningService extends BaseReasoningService {
       stream: true,
     };
 
-    const maxTokens = config.maxTokens || Math.max(4096, TOKEN_LIMITS.MAX_TOKENS);
-
-    if (useOldTokenParam) {
-      requestBody.temperature = config.temperature ?? 0.3;
-      requestBody.max_tokens = maxTokens;
-    } else {
-      requestBody[apiConfig.tokenParam] = maxTokens;
-      if (apiConfig.supportsTemperature) {
-        requestBody.temperature = config.temperature ?? 0.3;
-      }
-    }
+    applyChatCompletionsParams(requestBody, {
+      model,
+      provider: isLanChat ? "lan" : isLocalProvider ? "local" : provider,
+      endpoint,
+      config,
+      maxTokens: config.maxTokens || Math.max(4096, TOKEN_LIMITS.MAX_TOKENS),
+    });
 
     logger.logReasoning("AGENT_STREAM_REQUEST", {
       endpoint,
       model,
       provider,
       isLocal: isLocalProvider,
+      isLan: isLanChat,
       messageCount: messages.length,
     });
 
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
+      ...openCodeSessionHeaders(endpoint),
     };
     if (apiKey) {
       headers["Authorization"] = `Bearer ${apiKey}`;
     }
 
-    const response = await fetch(endpoint, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(requestBody),
-    });
+    const timeoutSeconds = getLlmRequestTimeoutSeconds({ streaming: true });
+    let timeoutTriggered = false;
+    const timeoutId = setTimeout(() => {
+      if (abortController.signal.aborted) return;
+      timeoutTriggered = true;
+      abortController.abort();
+    }, timeoutSeconds * 1000);
+
+    let response: Response;
+    try {
+      response = await fetchWithParamFallback(
+        () =>
+          fetch(endpoint, {
+            method: "POST",
+            headers,
+            body: JSON.stringify(requestBody),
+            signal: abortController.signal,
+          }),
+        requestBody,
+        logParamFallback("AGENT_STREAM_PARAM_FALLBACK")
+      );
+    } catch (error) {
+      clearTimeout(timeoutId);
+      if ((error as Error).name === "AbortError" && abortController.signal.aborted) {
+        if (!timeoutTriggered) return;
+        throw new Error("Streaming request timed out");
+      }
+      throw error;
+    }
 
     if (!response.ok) {
+      clearTimeout(timeoutId);
       const errorText = await response.text();
       let errorMessage: string;
       try {
         const errorData = JSON.parse(errorText);
-        errorMessage =
-          errorData.error?.message ||
-          errorData.message ||
-          errorData.error ||
-          `API error: ${response.status}`;
+        errorMessage = extractApiErrorMessage(errorData, `API error: ${response.status}`);
       } catch {
         errorMessage = errorText || `API error: ${response.status}`;
       }
@@ -1201,11 +677,15 @@ class ReasoningService extends BaseReasoningService {
     }
 
     const reader = response.body?.getReader();
-    if (!reader) throw new Error("No response body");
+    if (!reader) {
+      clearTimeout(timeoutId);
+      throw new Error("No response body");
+    }
 
     const decoder = new TextDecoder();
     let buffer = "";
-    let insideThinkBlock = false;
+    const stripThinking = (isLocalProvider || isLanChat) && config.disableThinking !== false;
+    const filterThinkTags = stripThinking ? createStreamingThinkFilter() : null;
 
     try {
       while (true) {
@@ -1221,36 +701,19 @@ class ReasoningService extends BaseReasoningService {
           if (!trimmed || !trimmed.startsWith("data: ")) continue;
 
           const data = trimmed.slice(6);
-          if (data === "[DONE]") return;
+          if (data === "[DONE]") {
+            const trailing = filterThinkTags?.finish();
+            if (trailing) yield trailing;
+            return;
+          }
 
           try {
             const parsed = JSON.parse(data);
             let content = parsed.choices?.[0]?.delta?.content;
             if (!content) continue;
 
-            // Strip Qwen3 <think> blocks from streamed output
-            if (isLocalProvider) {
-              if (insideThinkBlock) {
-                const endIdx = content.indexOf("</think>");
-                if (endIdx !== -1) {
-                  insideThinkBlock = false;
-                  content = content.slice(endIdx + 8);
-                } else {
-                  continue;
-                }
-              }
-              const startIdx = content.indexOf("<think>");
-              if (startIdx !== -1) {
-                const before = content.slice(0, startIdx);
-                const after = content.slice(startIdx + 7);
-                const endIdx = after.indexOf("</think>");
-                if (endIdx !== -1) {
-                  content = before + after.slice(endIdx + 8);
-                } else {
-                  insideThinkBlock = true;
-                  content = before;
-                }
-              }
+            if (filterThinkTags) {
+              content = filterThinkTags(content);
               if (!content) continue;
             }
 
@@ -1260,62 +723,502 @@ class ReasoningService extends BaseReasoningService {
           }
         }
       }
+
+      const trailing = filterThinkTags?.finish();
+      if (trailing) yield trailing;
+    } catch (error) {
+      if ((error as Error).name === "AbortError" && abortController.signal.aborted) {
+        if (!timeoutTriggered) return;
+        throw new Error("Streaming request timed out");
+      }
+      throw error;
     } finally {
+      clearTimeout(timeoutId);
       reader.releaseLock();
     }
   }
 
-  async *processTextStreamingCloud(
-    messages: Array<{ role: string; content: string }>,
-    config: { systemPrompt: string }
-  ): AsyncGenerator<string, void, unknown> {
-    const chunks: string[] = [];
-    let done = false;
-    let waiting: (() => void) | null = null;
-
-    const unsubChunk = window.electronAPI?.onAgentStreamChunk?.((chunk: string) => {
-      chunks.push(chunk);
-      waiting?.();
+  async *processTextStreamingAI(
+    // Content is a string, or text+image parts when a screenshot rides along
+    // (image-capable BYOK providers only — the caller drops it elsewhere).
+    messages: Array<{ role: string; content: string | Array<Record<string, unknown>> }>,
+    model: string,
+    provider: string,
+    config: ReasoningConfig & { systemPrompt: string },
+    tools?: Record<string, import("ai").Tool>
+  ): AsyncGenerator<AgentStreamChunk, void, unknown> {
+    ({ model, provider, config } = this.resolveManagedScope(
+      model,
+      provider,
+      config,
+      "chatIntelligence"
+    ));
+    const route = resolveChatRoute({
+      provider,
+      lanUrl: config.lanUrl,
+      customApiKey: config.customApiKey,
+      isEnterpriseProvider: isEnterpriseProvider(provider),
     });
-    const unsubDone = window.electronAPI?.onAgentStreamDone?.(() => {
-      done = true;
-      waiting?.();
-    });
+    const mode: InferenceMode =
+      route.kind === "self-hosted"
+        ? "self-hosted"
+        : route.kind === "enterprise"
+          ? "enterprise"
+          : route.kind === "local"
+            ? "local"
+            : "providers";
+    assertAgentSessionAllowedByPolicy(provider, mode);
+    // Both streaming transports share this owner so cancellation survives
+    // asynchronous server, key, and model setup.
+    const abortController = new AbortController();
+    this.streamAbortController = abortController;
+    const isEnterprise = route.kind === "enterprise";
+    const isLocalProvider = route.kind === "local";
+    const isLanChat = route.kind === "self-hosted";
 
-    try {
-      const result = await window.electronAPI?.cloudAgentStream?.(messages, {
-        systemPrompt: config.systemPrompt,
-      });
-
-      if (result && !result.success) {
-        throw new Error(result.error || "Cloud agent streaming failed");
-      }
-
-      while (!done || chunks.length > 0) {
-        if (chunks.length > 0) {
-          yield chunks.shift()!;
-        } else if (!done) {
-          await new Promise<void>((r) => {
-            waiting = r;
-          });
-          waiting = null;
+    if ((isLocalProvider || isLanChat) && !tools) {
+      // Attachments are never routed to local/LAN providers, so content is string-only here.
+      try {
+        const contentGen = this.processTextStreamingRaw(
+          messages as Array<{ role: string; content: string }>,
+          model,
+          provider,
+          config,
+          abortController
+        );
+        for await (const text of contentGen) {
+          yield { type: "content", text };
+        }
+        yield { type: "done", finishReason: "stop" };
+      } catch (error) {
+        if (abortController.signal.aborted && (error as Error).name === "AbortError") return;
+        throw error;
+      } finally {
+        if (this.streamAbortController === abortController) {
+          this.streamAbortController = null;
         }
       }
-    } finally {
-      unsubChunk?.();
-      unsubDone?.();
+      return;
     }
+
+    const filterThinkTags =
+      (isLocalProvider || isLanChat) && config.disableThinking !== false
+        ? createStreamingThinkFilter()
+        : null;
+    let apiKey = "";
+    let baseURL: string | undefined;
+
+    if (isEnterprise) {
+      // Enterprise SDKs run in the main process; the model below proxies
+      // doStream over IPC, so no key or base URL is resolved here.
+    } else if (isLanChat) {
+      apiKey = route.apiKey;
+      baseURL = resolveSelfHostedOpenAIBase(route.baseUrl);
+    } else if (isLocalProvider) {
+      const serverResult = await window.electronAPI.llamaServerStart(model);
+      if (!serverResult.success || !serverResult.port) {
+        throw new Error(serverResult.error || "Failed to start local model server");
+      }
+      baseURL = `http://127.0.0.1:${serverResult.port}/v1`;
+    } else {
+      ({ apiKey, baseURL } = await this.resolveByokAccess(provider, config));
+    }
+    const aiProvider = isLocalProvider || isLanChat ? "local" : provider;
+    // OpenRouter ids are never in the local registry, so the supportsThinking
+    // exemption below can't apply — honor the toggle directly.
+    const openrouterDisableThinking = provider === "openrouter" && config.disableThinking === true;
+    // Resolving a Tinfoil model refreshes the registry, so read model config after it.
+    const aiModel = isEnterprise
+      ? createEnterpriseChatModel(provider as EnterpriseProvider, model, config.inferenceScope)
+      : await getAIModel(aiProvider, model, apiKey, baseURL, {
+          disableThinking: openrouterDisableThinking,
+        });
+
+    if (abortController.signal.aborted) {
+      yield { type: "done", finishReason: "stop" };
+      return;
+    }
+
+    const apiConfig = detectEndpointDialect(baseURL) ?? getOpenAiApiConfig(model, provider);
+    const modelDef = getCloudModel(model);
+    const userSuppressesThinking = config.disableThinking === true && !!modelDef?.supportsThinking;
+    const needsGroqDisableThinking =
+      provider === "groq" && (modelDef?.disableThinking || userSuppressesThinking);
+    const needsGeminiMinimalThinking = provider === "gemini" && userSuppressesThinking;
+    const providerOptions = {
+      // The effort value is a family fact: gpt-oss has no "none" (#1611).
+      ...(needsGroqDisableThinking
+        ? {
+            groq: {
+              reasoningEffort:
+                getModelFamilyConstraints(model)?.reasoningEffort?.suppressValue ?? "none",
+            },
+          }
+        : {}),
+      ...(needsGeminiMinimalThinking
+        ? { google: { thinkingConfig: { thinkingLevel: "minimal", includeThoughts: false } } }
+        : {}),
+    };
+    const hasProviderOptions = Object.keys(providerOptions).length > 0;
+
+    logger.logReasoning("AGENT_AI_SDK_STREAM_REQUEST", {
+      model,
+      provider,
+      hasTools: !!tools,
+      toolCount: tools ? Object.keys(tools).length : 0,
+      messageCount: messages.length,
+    });
+
+    const useTemperature = isLocalProvider || isLanChat || apiConfig.supportsTemperature;
+
+    const result = streamText({
+      model: aiModel,
+      messages: messages.map((m) => ({
+        role: m.role as "system" | "user" | "assistant",
+        content: m.content,
+      })) as import("ai").ModelMessage[],
+      tools: tools || undefined,
+      stopWhen: stepCountIs(tools ? ReasoningService.MAX_TOOL_STEPS : 1),
+      abortSignal: abortController.signal,
+      ...(useTemperature ? { temperature: config.temperature ?? 0.3 } : {}),
+      maxOutputTokens: config.maxTokens || 4096,
+      ...(hasProviderOptions ? { providerOptions } : {}),
+    });
+
+    let canFlushFilteredText = true;
+    const finishFilteredText = (): string => {
+      const trailing = filterThinkTags?.finish() ?? "";
+      return canFlushFilteredText ? trailing : "";
+    };
+
+    try {
+      for await (const chunk of result.fullStream) {
+        if (chunk.type === "text-delta") {
+          const text = filterThinkTags ? filterThinkTags(chunk.text) : chunk.text;
+          if (text) yield { type: "content", text };
+        } else if (chunk.type === "text-end" || chunk.type === "finish-step") {
+          const trailing = finishFilteredText();
+          if (trailing) yield { type: "content", text: trailing };
+        } else if (chunk.type === "tool-call") {
+          yield {
+            type: "tool_calls",
+            calls: [
+              {
+                id: chunk.toolCallId,
+                name: chunk.toolName,
+                arguments: JSON.stringify(chunk.input),
+              },
+            ],
+          };
+        } else if (chunk.type === "tool-result") {
+          const output = chunk.output;
+          const displayText =
+            typeof output === "string" ? output : output?.error ? String(output.error) : "Done";
+          yield {
+            type: "tool_result",
+            callId: chunk.toolCallId,
+            toolName: chunk.toolName,
+            displayText,
+          };
+        } else if (chunk.type === "abort") {
+          canFlushFilteredText = false;
+          finishFilteredText();
+        } else if (chunk.type === "error") {
+          // streamText reports provider failures as error parts and then ends
+          // the stream; swallowing them leaves callers with an empty reply and
+          // no terminal signal. Re-throw unless we aborted on purpose.
+          canFlushFilteredText = false;
+          finishFilteredText();
+          if (!abortController.signal.aborted) {
+            const cause = (chunk as { error?: unknown }).error;
+            throw cause instanceof Error ? cause : new Error(String(cause ?? "Stream failed"));
+          }
+        } else if (chunk.type === "finish") {
+          const trailing = finishFilteredText();
+          if (trailing) yield { type: "content", text: trailing };
+          yield { type: "done", finishReason: chunk.finishReason };
+        }
+      }
+    } catch (error) {
+      canFlushFilteredText = false;
+      finishFilteredText();
+      if (abortController.signal.aborted) {
+        yield { type: "done", finishReason: "stop" };
+        return;
+      }
+      throw error;
+    } finally {
+      if (this.streamAbortController === abortController) {
+        this.streamAbortController = null;
+      }
+    }
+  }
+
+  /** Aborts the chat/agent stream only (panel Esc, chat surface unmount). */
+  cancelActiveStream(): void {
+    this.cloudOperationGeneration += 1;
+    this.streamAbortController?.abort();
+    this.streamAbortController = null;
+    const activeCloudStream = this.activeCloudStream;
+    this.activeCloudStream = null;
+    activeCloudStream?.cancel();
+  }
+
+  /**
+   * Aborts everything in flight in this renderer: the chat stream plus every
+   * single-shot request (cleanup, selection edit, titles) and the cloud-reason
+   * IPC jobs. Used by the dictation cancel path, never by chat lifecycle —
+   * a note or tab switch must not kill unrelated reasoning work.
+   */
+  cancelAllRequests(): void {
+    this.requestCancellationGeneration += 1;
+    for (const controller of this.activeRequestControllers) controller.abort();
+    this.activeRequestControllers.clear();
+    if (typeof window !== "undefined") {
+      window.electronAPI?.cancelCloudReason?.();
+      window.electronAPI?.cancelEnterpriseReasoning?.();
+    }
+    this.cancelActiveStream();
+  }
+
+  private streamFromIPC(
+    messages: Array<{ role: string; content: string | Array<unknown> }>,
+    opts: {
+      systemPrompt?: string;
+      tools?: Array<{ name: string; description: string; parameters: Record<string, unknown> }>;
+      // Press-time screenshot; the server routes to its vision chain when present.
+      screenContext?: { data: string; mediaType: string };
+    }
+  ): {
+    stream: AsyncGenerator<
+      {
+        type: string;
+        text?: string;
+        id?: string;
+        name?: string;
+        arguments?: string;
+        finishReason?: string;
+      },
+      void,
+      unknown
+    >;
+    wasCancelled: () => boolean;
+  } {
+    type StreamEvent = {
+      type: string;
+      text?: string;
+      id?: string;
+      name?: string;
+      arguments?: string;
+      finishReason?: string;
+    };
+    const queue: Array<StreamEvent | { type: "__error"; error: string } | { type: "__end" }> = [];
+    let resolve: (() => void) | null = null;
+    let cancelled = false;
+    let closed = false;
+    const requestId = crypto.randomUUID();
+    const electronAPI = window.electronAPI;
+
+    this.activeCloudStream?.cancel();
+
+    const cleanupChunk = electronAPI?.onAgentStreamChunk?.((payload) => {
+      if (payload.requestId !== requestId || closed || cancelled) return;
+      queue.push(payload.chunk);
+      resolve?.();
+    });
+    const cleanupError = electronAPI?.onAgentStreamError?.((payload) => {
+      if (payload.requestId !== requestId || closed || cancelled) return;
+      queue.push({ type: "__error", error: payload.error });
+      resolve?.();
+    });
+    const cleanupEnd = electronAPI?.onAgentStreamEnd?.((payload) => {
+      if (payload.requestId !== requestId || closed || cancelled) return;
+      queue.push({ type: "__end" });
+      resolve?.();
+    });
+
+    const cleanup = () => {
+      if (closed) return;
+      closed = true;
+      cleanupChunk?.();
+      cleanupError?.();
+      cleanupEnd?.();
+      if (this.activeCloudStream?.requestId === requestId) this.activeCloudStream = null;
+    };
+
+    const cancel = () => {
+      if (closed || cancelled) return;
+      cancelled = true;
+      electronAPI?.cancelAgentStream?.(requestId);
+      queue.length = 0;
+      queue.push({ type: "__end" });
+      resolve?.();
+    };
+    this.activeCloudStream = { requestId, cancel };
+
+    electronAPI?.startAgentStream?.(requestId, messages, opts);
+
+    const generator = (async function* () {
+      try {
+        while (true) {
+          if (queue.length === 0) {
+            await new Promise<void>((r) => {
+              resolve = r;
+            });
+            resolve = null;
+          }
+
+          while (queue.length > 0) {
+            const item = queue.shift()!;
+            if (item.type === "__end") return;
+            if (item.type === "__error") throw new Error((item as { error: string }).error);
+            yield item as StreamEvent;
+          }
+        }
+      } finally {
+        cleanup();
+      }
+    })();
+
+    return { stream: generator, wasCancelled: () => cancelled };
+  }
+
+  processTextStreamingCloud(
+    messages: Array<{ role: string; content: string | Array<unknown> }>,
+    config: {
+      systemPrompt: string;
+      tools?: Array<{ name: string; description: string; parameters: Record<string, unknown> }>;
+      executeToolCall?: (name: string, args: string) => Promise<ToolExecutionResult>;
+      screenContext?: { data: string; mediaType: string };
+    }
+  ): AsyncGenerator<AgentStreamChunk, void, unknown> {
+    // Capture synchronously so a cancel before the first next() is observed.
+    const operationGeneration = ++this.cloudOperationGeneration;
+    return this._processTextStreamingCloud(messages, config, operationGeneration);
+  }
+
+  private async *_processTextStreamingCloud(
+    messages: Array<{ role: string; content: string | Array<unknown> }>,
+    config: {
+      systemPrompt: string;
+      tools?: Array<{ name: string; description: string; parameters: Record<string, unknown> }>;
+      executeToolCall?: (name: string, args: string) => Promise<ToolExecutionResult>;
+      screenContext?: { data: string; mediaType: string };
+    },
+    operationGeneration: number
+  ): AsyncGenerator<AgentStreamChunk, void, unknown> {
+    assertAgentSessionAllowedByPolicy("openwhispr", "openwhispr");
+    const operationWasCancelled = (): boolean =>
+      operationGeneration !== this.cloudOperationGeneration;
+    const maxSteps = config.tools?.length ? ReasoningService.MAX_TOOL_STEPS : 1;
+    let currentMessages = [...messages];
+
+    for (let step = 0; step < maxSteps; step++) {
+      if (operationWasCancelled()) return;
+      // The screenshot rides every step of the tool loop so the model keeps
+      // its vision after tool results come back.
+      const ipcStream = this.streamFromIPC(currentMessages, {
+        systemPrompt: config.systemPrompt,
+        tools: config.tools,
+        screenContext: config.screenContext,
+      });
+
+      const pendingToolCalls: Array<{ id: string; name: string; arguments: string }> = [];
+
+      for await (const ev of ipcStream.stream) {
+        if (ev.type === "content") {
+          yield { type: "content", text: ev.text as string };
+        } else if (ev.type === "tool_call") {
+          const call = {
+            id: ev.id as string,
+            name: ev.name as string,
+            arguments: ev.arguments as string,
+          };
+          pendingToolCalls.push(call);
+          yield { type: "tool_calls", calls: [call] };
+        }
+      }
+
+      if (ipcStream.wasCancelled() || operationWasCancelled()) return;
+
+      if (pendingToolCalls.length === 0 || !config.executeToolCall) {
+        yield { type: "done", finishReason: "stop" };
+        return;
+      }
+
+      for (const call of pendingToolCalls) {
+        if (operationWasCancelled()) return;
+        let toolResult: ToolExecutionResult;
+        try {
+          toolResult = await config.executeToolCall(call.name, call.arguments);
+        } catch (error) {
+          const errMsg = `Error: ${(error as Error).message}`;
+          toolResult = { data: errMsg, displayText: errMsg };
+        }
+        if (operationWasCancelled()) return;
+        yield {
+          type: "tool_result",
+          callId: call.id,
+          toolName: call.name,
+          displayText: toolResult.displayText,
+          ...(toolResult.metadata ? { metadata: toolResult.metadata } : {}),
+        };
+
+        currentMessages = [
+          ...currentMessages,
+          {
+            role: "assistant",
+            content: [
+              {
+                type: "tool-call",
+                toolCallId: call.id,
+                toolName: call.name,
+                input: JSON.parse(call.arguments),
+              },
+            ],
+          },
+          {
+            role: "tool",
+            content: [
+              {
+                type: "tool-result",
+                toolCallId: call.id,
+                toolName: call.name,
+                output: { type: "text", value: toolResult.data },
+              },
+            ],
+          },
+        ];
+      }
+    }
+
+    if (operationWasCancelled()) return;
+    yield { type: "done", finishReason: "stop" };
   }
 
   async isAvailable(): Promise<boolean> {
     try {
-      if (isCloudReasoningMode()) {
-        logger.logReasoning("API_KEY_CHECK", { cloudReasoningMode: true });
+      const settings = getSettings();
+      // Mirrors processText's precedence: managed access outranks every manual route.
+      if (
+        getManagedScopeResolution("dictationCleanup", settings.enterpriseSetupMode).kind ===
+        "managed"
+      ) {
+        logger.logReasoning("API_KEY_CHECK", { managedEnterprise: true });
         return true;
       }
 
-      const settings = getSettings();
-      if (settings.reasoningProvider === "custom" && settings.cloudReasoningBaseUrl?.trim()) {
+      if (isCloudCleanupMode()) {
+        logger.logReasoning("API_KEY_CHECK", { cloudCleanupMode: true });
+        return true;
+      }
+
+      if (this.hasLanCleanupConfiguration()) {
+        logger.logReasoning("API_KEY_CHECK", { lanCleanup: true });
+        return true;
+      }
+
+      if (settings.cleanupProvider === "custom" && settings.cleanupCloudBaseUrl?.trim()) {
         logger.logReasoning("API_KEY_CHECK", {
           customProvider: true,
           hasCustomEndpoint: true,
@@ -1323,10 +1226,34 @@ class ReasoningService extends BaseReasoningService {
         return true;
       }
 
+      // Enterprise providers: detect credentials by provider, short-circuit.
+      // Runtime auth errors (expired SSO, missing ADC) surface via
+      // mapEnterpriseError with actionable remediation copy.
+      if (settings.cleanupProvider === "bedrock") {
+        const hasBedrockCreds =
+          !!settings.bedrockProfile?.trim() ||
+          (!!settings.bedrockAccessKeyId?.trim() && !!settings.bedrockSecretAccessKey?.trim());
+        logger.logReasoning("API_KEY_CHECK", { bedrock: true, hasBedrockCreds });
+        if (hasBedrockCreds) return true;
+      }
+      if (settings.cleanupProvider === "azure") {
+        const hasAzureCreds = !!settings.azureApiKey?.trim() && !!settings.azureEndpoint?.trim();
+        logger.logReasoning("API_KEY_CHECK", { azure: true, hasAzureCreds });
+        if (hasAzureCreds) return true;
+      }
+      if (settings.cleanupProvider === "vertex") {
+        const hasVertexCreds = !!settings.vertexApiKey?.trim() || !!settings.vertexProject?.trim();
+        logger.logReasoning("API_KEY_CHECK", { vertex: true, hasVertexCreds });
+        if (hasVertexCreds) return true;
+      }
+
       const openaiKey = await window.electronAPI?.getOpenAIKey?.();
       const anthropicKey = await window.electronAPI?.getAnthropicKey?.();
       const geminiKey = await window.electronAPI?.getGeminiKey?.();
       const groqKey = await window.electronAPI?.getGroqKey?.();
+      const openrouterKey = await window.electronAPI?.getOpenrouterKey?.();
+      const tinfoilKey = await window.electronAPI?.getTinfoilKey?.();
+      const cortiKey = await window.electronAPI?.getCortiKey?.();
       const localAvailable = await window.electronAPI?.checkLocalReasoningAvailable?.();
 
       logger.logReasoning("API_KEY_CHECK", {
@@ -1334,10 +1261,22 @@ class ReasoningService extends BaseReasoningService {
         hasAnthropic: !!anthropicKey,
         hasGemini: !!geminiKey,
         hasGroq: !!groqKey,
+        hasOpenrouter: !!openrouterKey,
+        hasTinfoil: !!tinfoilKey,
+        hasCorti: !!cortiKey,
         hasLocal: !!localAvailable,
       });
 
-      return !!(openaiKey || anthropicKey || geminiKey || groqKey || localAvailable);
+      return !!(
+        openaiKey ||
+        anthropicKey ||
+        geminiKey ||
+        groqKey ||
+        openrouterKey ||
+        tinfoilKey ||
+        cortiKey ||
+        localAvailable
+      );
     } catch (error) {
       logger.logReasoning("API_KEY_CHECK_ERROR", {
         error: (error as Error).message,
@@ -1349,20 +1288,34 @@ class ReasoningService extends BaseReasoningService {
   }
 
   clearApiKeyCache(
-    provider?: "openai" | "anthropic" | "gemini" | "groq" | "mistral" | "custom"
+    provider?:
+      | "openai"
+      | "anthropic"
+      | "gemini"
+      | "groq"
+      | "mistral"
+      | "tinfoil"
+      | "custom"
+      | "openrouter"
+      | "corti"
   ): void {
     if (provider) {
       if (provider !== "custom") {
         this.apiKeyCache.delete(provider);
       }
+      if (provider === "tinfoil") {
+        clearTinfoilClientCache();
+      }
       logger.logReasoning("API_KEY_CACHE_CLEARED", { provider });
     } else {
       this.apiKeyCache.clear();
+      clearTinfoilClientCache();
       logger.logReasoning("API_KEY_CACHE_CLEARED", { provider: "all" });
     }
   }
 
   destroy(): void {
+    this.cancelAllRequests();
     if (this.cacheCleanupStop) {
       this.cacheCleanupStop();
     }

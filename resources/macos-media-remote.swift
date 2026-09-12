@@ -1,69 +1,54 @@
+import AppKit
 import Foundation
 
-// MediaRemote.framework command constants
-let kMRPlay: UInt32 = 0
-let kMRPause: UInt32 = 1
-let kMRTogglePlayPause: UInt32 = 2
+// Posts a media play/pause NSEvent (NSEventSubtypeMediaKey / NX_KEYTYPE_PLAY),
+// the only event class media apps (Spotify, Music, browser tabs) listen for —
+// synthetic F-key codes are not media keys.
+//
+// State-aware pause/resume is handled by the vendored mediaremote-adapter
+// loaded through /usr/bin/perl; this helper is the fallback when the adapter
+// is unavailable.
 
-// C function type aliases from MediaRemote.framework
-typealias MRMediaRemoteSendCommandType = @convention(c) (UInt32, Optional<AnyObject>) -> Bool
-typealias MRMediaRemoteGetNowPlayingApplicationIsPlayingType = @convention(c) (DispatchQueue, @escaping (Bool) -> Void) -> Void
-
-func loadMediaRemote() -> (send: MRMediaRemoteSendCommandType, isPlaying: MRMediaRemoteGetNowPlayingApplicationIsPlayingType)? {
-    let frameworkPath = "/System/Library/PrivateFrameworks/MediaRemote.framework/MediaRemote"
-    guard let handle = dlopen(frameworkPath, RTLD_NOW) else { return nil }
-
-    guard let sendPtr = dlsym(handle, "MRMediaRemoteSendCommand"),
-          let isPlayingPtr = dlsym(handle, "MRMediaRemoteGetNowPlayingApplicationIsPlaying") else {
-        return nil
-    }
-
-    let send = unsafeBitCast(sendPtr, to: MRMediaRemoteSendCommandType.self)
-    let isPlaying = unsafeBitCast(isPlayingPtr, to: MRMediaRemoteGetNowPlayingApplicationIsPlayingType.self)
-    return (send: send, isPlaying: isPlaying)
-}
-
-func checkIsPlaying(_ isPlayingFn: MRMediaRemoteGetNowPlayingApplicationIsPlayingType) -> Bool {
-    let semaphore = DispatchSemaphore(value: 0)
-    var playing = false
-    isPlayingFn(DispatchQueue.main) { result in
-        playing = result
-        semaphore.signal()
-    }
-    _ = semaphore.wait(timeout: .now() + 2)
-    return playing
-}
-
-guard let mr = loadMediaRemote() else {
-    print("ERROR")
-    exit(1)
-}
+let usage = "Usage: macos-media-remote --media-key-toggle"
 
 let args = CommandLine.arguments
 let command = args.count > 1 ? args[1] : ""
 
-switch command {
-case "--is-playing":
-    let playing = checkIsPlaying(mr.isPlaying)
-    print(playing ? "PLAYING" : "NOT_PLAYING")
-    exit(playing ? 0 : 1)
-
-case "--pause":
-    let playing = checkIsPlaying(mr.isPlaying)
-    if !playing {
-        print("NOT_PLAYING")
-        exit(1)
-    }
-    let ok = mr.send(kMRPause, nil)
-    print(ok ? "OK" : "FAIL")
-    exit(ok ? 0 : 1)
-
-case "--play":
-    let ok = mr.send(kMRPlay, nil)
-    print(ok ? "OK" : "FAIL")
-    exit(ok ? 0 : 1)
-
-default:
-    print("Usage: macos-media-remote --is-playing|--pause|--play")
+guard command == "--media-key-toggle" else {
+    print(usage)
     exit(1)
 }
+
+let NSEventSubtypeMediaKey: Int16 = 8
+let NX_KEYTYPE_PLAY: Int32 = 16
+
+func postMediaKey(keyDown: Bool) -> Bool {
+    let flags: UInt = keyDown ? 0xA00 : 0xB00
+    let state: Int32 = keyDown ? 0xA : 0xB
+    let data1 = (NX_KEYTYPE_PLAY << 16) | (state << 8)
+
+    guard let event = NSEvent.otherEvent(
+        with: .systemDefined,
+        location: .zero,
+        modifierFlags: NSEvent.ModifierFlags(rawValue: flags),
+        timestamp: 0,
+        windowNumber: 0,
+        context: nil,
+        subtype: NSEventSubtypeMediaKey,
+        data1: Int(data1),
+        data2: -1
+    ) else {
+        return false
+    }
+    guard let cgEvent = event.cgEvent else { return false }
+    cgEvent.post(tap: .cghidEventTap)
+    return true
+}
+
+guard postMediaKey(keyDown: true), postMediaKey(keyDown: false) else {
+    print("FAIL")
+    exit(1)
+}
+
+print("OK")
+exit(0)

@@ -2,6 +2,7 @@ const { spawn } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 const debugLogger = require("./debugLogger");
+const { compareVersions } = require("./parakeetCapability");
 
 const ARCH_CPU_TYPE = {
   arm64: 0x0100000c,
@@ -14,34 +15,15 @@ const START_TIMEOUT_MS = 3000;
 const REQUEST_TIMEOUT_MS = 60000;
 const STOP_TIMEOUT_MS = 5000;
 
-function compareVersions(left, right) {
-  const leftParts = String(left)
-    .split(".")
-    .map((part) => parseInt(part, 10) || 0);
-  const rightParts = String(right)
-    .split(".")
-    .map((part) => parseInt(part, 10) || 0);
-  const length = Math.max(leftParts.length, rightParts.length);
-
-  for (let index = 0; index < length; index += 1) {
-    const leftPart = leftParts[index] || 0;
-    const rightPart = rightParts[index] || 0;
-    if (leftPart !== rightPart) {
-      return leftPart > rightPart ? 1 : -1;
-    }
-  }
-
-  return 0;
-}
-
 class AudioTapManager {
   constructor() {
     this.process = null;
     this.stderrBuffer = "";
     this.onChunk = null;
     this.onError = null;
+    this.onWarning = null;
     this.isStopping = false;
-    this.permissionStatus = "unknown";
+    this.permissionStatus = this._loadPermissionStatus();
     this._requestPromise = null;
   }
 
@@ -69,12 +51,45 @@ class AudioTapManager {
     return this.permissionStatus;
   }
 
+  checkAccess() {
+    if (!this.isSupported()) {
+      return { granted: false, status: "unsupported" };
+    }
+    const status = this.getPermissionStatus();
+    return { granted: status === "granted", status };
+  }
+
+  _statusFilePath() {
+    const { app } = require("electron");
+    return path.join(app.getPath("userData"), ".system-audio-permission");
+  }
+
+  _loadPermissionStatus() {
+    try {
+      const status = fs.readFileSync(this._statusFilePath(), "utf8").trim();
+      if (status === "granted" || status === "denied") return status;
+    } catch {
+      // File doesn't exist yet — first launch or reset.
+    }
+    return "unknown";
+  }
+
+  _persistPermissionStatus(status) {
+    if (status !== "granted" && status !== "denied") return;
+    this.permissionStatus = status;
+    try {
+      fs.writeFileSync(this._statusFilePath(), status);
+    } catch {
+      // Non-critical — status is still cached in memory for this session.
+    }
+  }
+
   async requestAccess() {
     if (!this.isSupported()) {
       return { granted: false, status: "unsupported" };
     }
     if (this.process) {
-      this.permissionStatus = "granted";
+      this._persistPermissionStatus("granted");
       return { granted: true, status: "granted" };
     }
     if (this._requestPromise) {
@@ -84,7 +99,7 @@ class AudioTapManager {
     this._requestPromise = this._probeForAccess()
       .catch((error) => {
         const status = error.code === "permission_denied" ? "denied" : "unknown";
-        this.permissionStatus = status;
+        this._persistPermissionStatus(status);
         return { granted: false, status, error: error.message };
       })
       .finally(() => {
@@ -94,14 +109,14 @@ class AudioTapManager {
     return this._requestPromise;
   }
 
-  async start({ onChunk, onError } = {}) {
+  async start({ onChunk, onError, onWarning } = {}) {
     if (!this.isSupported()) {
       throw new Error("macOS 14.2 or later is required for native system audio capture.");
     }
     if (this.process) {
       this.onChunk = onChunk || null;
       this.onError = onError || null;
-      this.permissionStatus = "granted";
+      this.onWarning = onWarning || null;
       return;
     }
     if (this._requestPromise) {
@@ -111,6 +126,7 @@ class AudioTapManager {
     const binaryPath = this._prepareBinary();
     this.onChunk = onChunk || null;
     this.onError = onError || null;
+    this.onWarning = onWarning || null;
     this.isStopping = false;
     this.stderrBuffer = "";
 
@@ -156,15 +172,20 @@ class AudioTapManager {
         }
         this._consumeStderr(chunk, (message) => {
           if (message.type === "start") {
-            this.permissionStatus = "granted";
+            this._persistPermissionStatus("granted");
             finish(resolve);
+            return;
+          }
+
+          if (message.type === "warning") {
+            this.onWarning?.(message);
             return;
           }
 
           if (message.type === "error") {
             const error = this._buildProcessError(message);
             if (error.code === "permission_denied") {
-              this.permissionStatus = "denied";
+              this._persistPermissionStatus("denied");
             }
             if (!settled) {
               finish(reject, error, true);
@@ -245,6 +266,7 @@ class AudioTapManager {
     this.stderrBuffer = "";
     this.onChunk = null;
     this.onError = null;
+    this.onWarning = null;
     this.isStopping = false;
   }
 
@@ -288,14 +310,14 @@ class AudioTapManager {
             try {
               const message = JSON.parse(line);
               if (message.type === "start") {
-                this.permissionStatus = "granted";
+                this._persistPermissionStatus("granted");
                 finish(resolve, { granted: true, status: "granted" }, true);
                 return;
               }
               if (message.type === "error") {
                 const error = this._buildProcessError(message);
                 if (error.code === "permission_denied") {
-                  this.permissionStatus = "denied";
+                  this._persistPermissionStatus("denied");
                 }
                 finish(reject, error, true);
                 return;

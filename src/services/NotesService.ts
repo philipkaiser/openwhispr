@@ -1,7 +1,10 @@
-import { OPENWHISPR_API_URL } from "../config/constants.js";
+import { cloudGet, cloudPost, cloudPatch, cloudDelete } from "./cloudApi.js";
+import { buildNotesListPath } from "./noteListQuery";
 
 interface NoteInput {
   client_note_id?: string;
+  workspace_id?: string | null;
+  space_id?: string | null;
   title?: string | null;
   content?: string;
   enhanced_content?: string | null;
@@ -9,17 +12,52 @@ interface NoteInput {
   note_type?: "personal" | "meeting" | "upload";
   source_file?: string | null;
   audio_duration_seconds?: number | null;
+  participants?: string | null;
+  calendar_event_id?: string | null;
+  diarization_enabled?: number | null;
+  expected_speaker_count?: number | null;
+  transcript?: string | null;
+  enhanced_at_content_hash?: string | null;
+  folder_id?: string | null;
   created_at?: string;
   updated_at?: string;
+  // Optimistic-concurrency base on updates: the server updated_at this device
+  // last acked. The server 409s (note_version_conflict) when a newer write
+  // landed; omitted = legacy last-write-wins.
+  base_updated_at?: string;
 }
 
-interface CloudNote {
+export interface CloudNote {
   id: string;
   client_note_id: string | null;
   title: string | null;
   content: string;
   enhanced_content: string | null;
   note_type: string;
+  enhancement_prompt: string | null;
+  source_file: string | null;
+  audio_duration_seconds: number | null;
+  folder_id: string | null;
+  transcript: string | null;
+  enhanced_at_content_hash: string | null;
+  participants: string | null;
+  calendar_event_id: string | null;
+  diarization_enabled: number | null;
+  expected_speaker_count: number | null;
+  workspace_id: string | null;
+  space_id: string | null;
+  // The note's owner (creator), not its last editor. Absent on access_removed
+  // stubs and on API versions that predate ownership.
+  user_id?: string | null;
+  // Creator attribution is separate from the operational custodian. It is
+  // explicitly null after the creator deletes their account.
+  created_by_user_id?: string | null;
+  updated_by_user_id: string | null;
+  previous_space_id?: string | null;
+  // Redacted stub for a row that moved out of one of the caller's spaces —
+  // only id/client_note_id/scope/updated_at are present.
+  access_removed?: boolean;
+  deleted_at: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -29,93 +67,66 @@ interface SearchResult extends CloudNote {
 }
 
 async function create(note: NoteInput): Promise<CloudNote> {
-  const res = await fetch(`${OPENWHISPR_API_URL}/api/notes/create`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    credentials: "include",
-    body: JSON.stringify(note),
-  });
-  if (!res.ok) throw new Error(await res.text());
-  return res.json() as Promise<CloudNote>;
+  return cloudPost<CloudNote>("/api/notes/create", note);
 }
 
 async function batchCreate(
   notes: NoteInput[]
-): Promise<{ created: { client_note_id: string; id: string }[] }> {
-  const res = await fetch(`${OPENWHISPR_API_URL}/api/notes/batch-create`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    credentials: "include",
-    body: JSON.stringify({ notes }),
-  });
-  if (!res.ok) throw new Error(await res.text());
-  return res.json() as Promise<{ created: { client_note_id: string; id: string }[] }>;
+): Promise<{ created: { client_note_id: string; id: string; updated_at?: string }[] }> {
+  return cloudPost<{ created: { client_note_id: string; id: string; updated_at?: string }[] }>(
+    "/api/notes/batch-create",
+    { notes }
+  );
 }
 
 async function update(id: string, updates: Partial<NoteInput>): Promise<CloudNote> {
-  const res = await fetch(`${OPENWHISPR_API_URL}/api/notes/update`, {
-    method: "PATCH",
-    headers: { "Content-Type": "application/json" },
-    credentials: "include",
-    body: JSON.stringify({ id, ...updates }),
-  });
-  if (!res.ok) throw new Error(await res.text());
-  return res.json() as Promise<CloudNote>;
+  return cloudPatch<CloudNote>("/api/notes/update", { id, ...updates });
 }
 
 async function deleteNote(id: string): Promise<void> {
-  const res = await fetch(`${OPENWHISPR_API_URL}/api/notes/delete`, {
-    method: "DELETE",
-    headers: { "Content-Type": "application/json" },
-    credentials: "include",
-    body: JSON.stringify({ id }),
-  });
-  if (!res.ok) throw new Error(await res.text());
+  await cloudDelete("/api/notes/delete", { id });
 }
 
-async function list(limit?: number, before?: string): Promise<{ notes: CloudNote[] }> {
-  const params = new URLSearchParams();
-  if (limit !== undefined) params.set("limit", String(limit));
-  if (before !== undefined) params.set("before", before);
-  const query = params.toString();
-  const res = await fetch(`${OPENWHISPR_API_URL}/api/notes/list${query ? `?${query}` : ""}`, {
-    credentials: "include",
-  });
-  if (!res.ok) throw new Error(await res.text());
-  return res.json() as Promise<{ notes: CloudNote[] }>;
+async function list(
+  limit?: number,
+  before?: string,
+  since?: string,
+  scope?: "all",
+  cursorId?: string
+): Promise<{ notes: CloudNote[] }> {
+  return cloudGet<{ notes: CloudNote[] }>(
+    buildNotesListPath({ limit, before, since, scope, cursorId })
+  );
 }
 
 async function deleteAll(): Promise<{ deleted: number; errors: number }> {
-  // Try bulk endpoint first; fall back to per-note deletion
   try {
-    const res = await fetch(`${OPENWHISPR_API_URL}/api/notes/delete-all`, {
-      method: "DELETE",
-      credentials: "include",
-    });
-    if (res.ok) {
-      const data = (await res.json()) as { deleted?: number };
-      return { deleted: data.deleted ?? 0, errors: 0 };
-    }
+    const data = await cloudDelete<{ deleted?: number }>("/api/notes/delete-all");
+    return { deleted: data?.deleted ?? 0, errors: 0 };
   } catch {
     // bulk endpoint doesn't exist — fall through
   }
 
-  // Fallback: list all and delete one-by-one
   const { notes } = await list(9999);
   const results = await Promise.allSettled(notes.map((n) => deleteNote(n.id)));
   const errors = results.filter((r) => r.status === "rejected").length;
   return { deleted: results.length - errors, errors };
 }
 
-async function search(query: string, limit?: number): Promise<{ notes: SearchResult[] }> {
-  const res = await fetch(`${OPENWHISPR_API_URL}/api/notes/search`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    credentials: "include",
-    body: JSON.stringify({ query, ...(limit !== undefined ? { limit } : {}) }),
+// scope "all" opts into space results (legacy clients stay personal-only);
+// space_id narrows to a single space and takes precedence over scope.
+async function search(
+  query: string,
+  limit?: number,
+  scope?: "all",
+  spaceId?: string
+): Promise<{ notes: SearchResult[] }> {
+  return cloudPost<{ notes: SearchResult[] }>("/api/notes/search", {
+    query,
+    ...(limit !== undefined ? { limit } : {}),
+    ...(scope !== undefined ? { scope } : {}),
+    ...(spaceId !== undefined ? { space_id: spaceId } : {}),
   });
-  if (!res.ok) throw new Error(await res.text());
-  return res.json() as Promise<{ notes: SearchResult[] }>;
 }
 
 export { create, batchCreate, update, deleteNote, deleteAll, list, search };

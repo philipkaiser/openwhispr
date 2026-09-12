@@ -32,14 +32,18 @@ class LocalReasoningService {
 
     try {
       const inferenceConfig = {
-        maxTokens: config.maxTokens || this.calculateMaxTokens(text.length),
-        temperature: config.temperature || 0.7,
-        topK: config.topK || 40,
-        topP: config.topP || 0.9,
-        repeatPenalty: config.repeatPenalty || 1.1,
-        contextSize: config.contextSize || 4096,
-        threads: config.threads || 4,
+        maxTokens: config.maxTokens ?? this.calculateMaxTokens(text.length),
+        temperature: config.temperature ?? 0.7,
+        topK: config.topK ?? 40,
+        topP: config.topP ?? 0.9,
+        repeatPenalty: config.repeatPenalty ?? 1.1,
         systemPrompt: config.systemPrompt || "",
+        disableThinking: config.disableThinking !== false,
+        requireCompleteOutput: config.requireCompleteOutput,
+        // A minimum context window for this request. Rebuilding this object
+        // field-by-field is what silently orphaned it before #2142: it was
+        // declared, written by selection editing, and never forwarded.
+        contextSize: config.contextSize,
       };
 
       debugLogger.logReasoning("LOCAL_BRIDGE_INFERENCE", {
@@ -48,10 +52,10 @@ class LocalReasoningService {
       });
 
       const result = await modelManager.runInference(modelId, text, inferenceConfig);
-      const cleanResult = result
-        .replace(/<think>[\s\S]*?<\/think>/g, "")
-        .replace(/<think>[\s\S]*$/, "")
-        .trim();
+      const stripThinking = config.disableThinking !== false;
+      const cleanResult = stripThinking
+        ? (await import("../helpers/stripThinking.js")).stripThinkingTags(result)
+        : result.trim();
 
       const processingTime = Date.now() - startTime;
 

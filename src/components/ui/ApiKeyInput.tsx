@@ -1,6 +1,6 @@
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, useCallback } from "react";
 import { useTranslation } from "react-i18next";
-import { Check, X, KeyRound } from "lucide-react";
+import { Check, X, KeyRound } from "../icons";
 import { Input } from "./input";
 import logger from "../../utils/logger";
 
@@ -54,14 +54,14 @@ export default function ApiKeyInput({
     setIsEditing(true);
   };
 
-  const save = () => {
+  const save = useCallback(() => {
     try {
       setApiKey(draft.trim());
     } catch (err) {
       logger.warn("Failed to save API key", { error: (err as Error).message }, "settings");
     }
     setIsEditing(false);
-  };
+  }, [draft, setApiKey]);
 
   const cancel = () => {
     setDraft("");
@@ -79,15 +79,17 @@ export default function ApiKeyInput({
     }
   };
 
+  // Commit the draft instead of discarding it — users paste a key and click
+  // the next field expecting it to stick (Escape or ✕ still cancels).
   useEffect(() => {
     if (!isEditing) return;
     const handleClickOutside = (e: MouseEvent) => {
       if (containerRef.current?.contains(e.target as Node)) return;
-      cancel();
+      save();
     };
     document.addEventListener("mousedown", handleClickOutside);
     return () => document.removeEventListener("mousedown", handleClickOutside);
-  }, [isEditing]);
+  }, [isEditing, save]);
 
   return (
     <div className={className}>
@@ -97,8 +99,9 @@ export default function ApiKeyInput({
 
       <div ref={containerRef} className="relative">
         {isEditing ? (
-          <div className="relative">
+          <div dir="ltr" className="relative">
             <Input
+              dir="ltr"
               ref={inputRef}
               type="text"
               placeholder={resolvedPlaceholder}
@@ -122,7 +125,7 @@ export default function ApiKeyInput({
               <button
                 type="button"
                 onClick={cancel}
-                className="h-6 w-6 flex items-center justify-center rounded text-muted-foreground/50 hover:text-muted-foreground hover:bg-muted/50 active:scale-95 transition-all"
+                className="h-6 w-6 flex items-center justify-center rounded text-muted-foreground/70 hover:text-muted-foreground hover:bg-muted/50 active:scale-95 transition-all"
                 aria-label={t("apiKeyInput.cancelEdit")}
               >
                 <X className="w-3.5 h-3.5" />
@@ -135,20 +138,23 @@ export default function ApiKeyInput({
             onClick={enterEdit}
             className={`w-full h-8 flex items-center px-3 rounded border text-sm transition-all cursor-pointer group ${
               hasKey
-                ? "border-border/70 bg-input hover:border-border-hover dark:bg-surface-1 dark:border-border-subtle/50 dark:hover:border-border-hover"
-                : "border-dashed border-border/40 bg-transparent hover:border-border/70 hover:bg-muted/30"
+                ? "border-border/70 bg-input hover:border-border-hover dark:bg-surface-1 dark:border-border-subtle/60 dark:hover:border-border-hover"
+                : "border-dashed border-border/70 bg-transparent hover:border-border/70 hover:bg-muted/30"
             }`}
             aria-label={hasKey ? t("apiKeyInput.edit") : t("apiKeyInput.add")}
           >
             {hasKey ? (
-              <span className="flex items-center gap-1.5 text-foreground/70 font-mono text-xs tracking-wide">
-                <KeyRound className="w-3 h-3 text-muted-foreground/50 shrink-0" />
+              <span
+                dir="ltr"
+                className="flex items-center gap-1.5 text-foreground/70 font-mono text-xs tracking-wide"
+              >
+                <KeyRound className="w-3 h-3 text-muted-foreground/70 shrink-0" />
                 {maskKey(apiKey)}
               </span>
             ) : (
-              <span className="text-muted-foreground/40 text-xs">{resolvedPlaceholder}</span>
+              <span className="text-muted-foreground/70 text-xs">{resolvedPlaceholder}</span>
             )}
-            <span className="ml-auto text-muted-foreground/30 text-xs group-hover:text-muted-foreground/60 transition-colors">
+            <span className="ms-auto text-muted-foreground/70 text-xs group-hover:text-muted-foreground/70 transition-colors">
               {hasKey ? t("apiKeyInput.editButton") : t("apiKeyInput.addButton")}
             </span>
           </button>

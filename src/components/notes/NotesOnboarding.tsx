@@ -1,9 +1,14 @@
 import { useState, useEffect, useCallback } from "react";
+import { useShallow } from "zustand/react/shallow";
 import { useTranslation } from "react-i18next";
-import { Sparkles, Plus, ChevronRight, Zap, Loader2, Check, Monitor } from "lucide-react";
+import { Sparkles, Plus, ChevronRight, Zap, Loader2, Check, Monitor } from "../icons";
 import { Button } from "../ui/button";
 import { cn } from "../lib/utils";
-import { useSettingsStore } from "../../stores/settingsStore";
+import {
+  selectPolicyEffectiveSettings,
+  selectResolvedLLMConfig,
+  useSettingsStore,
+} from "../../stores/settingsStore";
 import { useNotesOnboarding } from "../../hooks/useNotesOnboarding";
 import {
   useActions,
@@ -16,6 +21,8 @@ import { useDialogs } from "../../hooks/useDialogs";
 import { AlertDialog } from "../ui/dialog";
 import ReasoningModelSelector from "../ReasoningModelSelector";
 import { useSystemAudioPermission } from "../../hooks/useSystemAudioPermission";
+import { canManageSystemAudioInApp } from "../../utils/systemAudioAccess";
+import { usePolicySnapshot } from "../../hooks/usePolicy";
 
 interface NotesOnboardingProps {
   onComplete: () => void;
@@ -33,31 +40,31 @@ export default function NotesOnboarding({ onComplete }: NotesOnboardingProps) {
   const [isSaving, setIsSaving] = useState(false);
   const [justCreated, setJustCreated] = useState(false);
 
-  const reasoningModel = useSettingsStore((s) => s.reasoningModel);
-  const setReasoningModel = useSettingsStore((s) => s.setReasoningModel);
-  const reasoningProvider = useSettingsStore((s) => s.reasoningProvider);
-  const setReasoningProvider = useSettingsStore((s) => s.setReasoningProvider);
-  const cloudReasoningBaseUrl = useSettingsStore((s) => s.cloudReasoningBaseUrl);
-  const setCloudReasoningBaseUrl = useSettingsStore((s) => s.setCloudReasoningBaseUrl);
-  const openaiApiKey = useSettingsStore((s) => s.openaiApiKey);
-  const setOpenaiApiKey = useSettingsStore((s) => s.setOpenaiApiKey);
-  const anthropicApiKey = useSettingsStore((s) => s.anthropicApiKey);
-  const setAnthropicApiKey = useSettingsStore((s) => s.setAnthropicApiKey);
-  const geminiApiKey = useSettingsStore((s) => s.geminiApiKey);
-  const setGeminiApiKey = useSettingsStore((s) => s.setGeminiApiKey);
-  const groqApiKey = useSettingsStore((s) => s.groqApiKey);
-  const setGroqApiKey = useSettingsStore((s) => s.setGroqApiKey);
-  const customReasoningApiKey = useSettingsStore((s) => s.customReasoningApiKey);
-  const setCustomReasoningApiKey = useSettingsStore((s) => s.setCustomReasoningApiKey);
+  const policyState = usePolicySnapshot();
+  const cleanupConfig = useSettingsStore(
+    useShallow((settings) =>
+      selectResolvedLLMConfig(
+        selectPolicyEffectiveSettings(settings, policyState),
+        "dictationCleanup"
+      )
+    )
+  );
+  const setCleanupModel = useSettingsStore((s) => s.setCleanupModel);
+  const setCleanupProvider = useSettingsStore((s) => s.setCleanupProvider);
+  const setCleanupMode = useSettingsStore((s) => s.setCleanupMode);
+  const setCleanupCloudBaseUrl = useSettingsStore((s) => s.setCleanupCloudBaseUrl);
+  const setCleanupCustomApiKey = useSettingsStore((s) => s.setCleanupCustomApiKey);
 
   const { alertDialog, hideAlertDialog } = useDialogs();
   const {
     granted: systemAudioGranted,
     mode: systemAudioMode,
     request: requestSystemAudio,
-    isMacOS,
   } = useSystemAudioPermission();
   const [isRequestingSystemAudio, setIsRequestingSystemAudio] = useState(false);
+  const shouldShowSystemAudioPermission = canManageSystemAudioInApp({
+    mode: systemAudioMode,
+  });
 
   const handleGrantSystemAudio = useCallback(async () => {
     setIsRequestingSystemAudio(true);
@@ -112,7 +119,7 @@ export default function NotesOnboarding({ onComplete }: NotesOnboardingProps) {
           <h2 className="text-sm font-semibold text-foreground mb-1">
             {t("notes.onboarding.actions.title")}
           </h2>
-          <p className="text-xs text-foreground/35 leading-relaxed max-w-[320px]">
+          <p className="text-xs text-foreground/45 leading-relaxed max-w-[320px]">
             {t("notes.onboarding.actions.description")}
           </p>
         </div>
@@ -124,19 +131,19 @@ export default function NotesOnboarding({ onComplete }: NotesOnboardingProps) {
               "rounded-lg border transition-colors duration-200",
               isLLMConfigured
                 ? "border-success/20 bg-success/[0.03]"
-                : "border-foreground/8 dark:border-white/6 bg-surface-1/30 dark:bg-white/[0.02]"
+                : "border-foreground/8 dark:border-white/10 bg-surface-1/30 dark:bg-white/[0.02]"
             )}
           >
             <button
               type="button"
               onClick={() => setLlmExpanded(!llmExpanded)}
               aria-expanded={llmExpanded}
-              className="flex items-center justify-between w-full px-4 py-3 text-left"
+              className="flex items-center justify-between w-full px-4 py-3 text-start"
             >
               <div className="flex items-center gap-2.5">
                 <Zap
                   size={13}
-                  className={cn(isLLMConfigured ? "text-success/60" : "text-foreground/30")}
+                  className={cn(isLLMConfigured ? "text-success/60" : "text-foreground/45")}
                 />
                 <span className="text-xs font-medium text-foreground/70">
                   {t("notes.onboarding.llm.title")}
@@ -150,68 +157,61 @@ export default function NotesOnboarding({ onComplete }: NotesOnboardingProps) {
               <ChevronRight
                 size={12}
                 className={cn(
-                  "text-foreground/20 transition-transform duration-200",
-                  llmExpanded && "rotate-90"
+                  "text-foreground/45 transition-transform duration-200",
+                  llmExpanded ? "rotate-90" : "rtl:rotate-180"
                 )}
               />
             </button>
 
             {llmExpanded && (
               <div className="px-4 pb-4 space-y-3" style={{ animation: "float-up 0.2s ease-out" }}>
-                <p className="text-xs text-foreground/30 leading-relaxed">
+                <p className="text-xs text-foreground/45 leading-relaxed">
                   {t("notes.onboarding.llm.description")}
                 </p>
 
                 <ReasoningModelSelector
-                  reasoningModel={reasoningModel}
-                  setReasoningModel={setReasoningModel}
-                  localReasoningProvider={reasoningProvider}
-                  setLocalReasoningProvider={setReasoningProvider}
-                  cloudReasoningBaseUrl={cloudReasoningBaseUrl}
-                  setCloudReasoningBaseUrl={setCloudReasoningBaseUrl}
-                  openaiApiKey={openaiApiKey}
-                  setOpenaiApiKey={setOpenaiApiKey}
-                  anthropicApiKey={anthropicApiKey}
-                  setAnthropicApiKey={setAnthropicApiKey}
-                  geminiApiKey={geminiApiKey}
-                  setGeminiApiKey={setGeminiApiKey}
-                  groqApiKey={groqApiKey}
-                  setGroqApiKey={setGroqApiKey}
-                  customReasoningApiKey={customReasoningApiKey}
-                  setCustomReasoningApiKey={setCustomReasoningApiKey}
+                  reasoningModel={cleanupConfig.model}
+                  setReasoningModel={setCleanupModel}
+                  localReasoningProvider={cleanupConfig.provider}
+                  setLocalReasoningProvider={setCleanupProvider}
+                  cloudReasoningBaseUrl={cleanupConfig.cloudBaseUrl ?? ""}
+                  setCloudReasoningBaseUrl={setCleanupCloudBaseUrl}
+                  customReasoningApiKey={cleanupConfig.customApiKey ?? ""}
+                  setCustomReasoningApiKey={setCleanupCustomApiKey}
+                  setReasoningMode={setCleanupMode}
                 />
               </div>
             )}
           </div>
         )}
 
-        {/* System Audio Permission — macOS only */}
-        {isMacOS && systemAudioMode === "native" && (
+        {/* System Audio Permission */}
+        {shouldShowSystemAudioPermission && (
           <div
             className={cn(
               "rounded-lg border transition-colors duration-200",
               systemAudioGranted
                 ? "border-success/20 bg-success/[0.03]"
-                : "border-foreground/8 dark:border-white/6 bg-surface-1/30 dark:bg-white/[0.02]"
+                : "border-foreground/8 dark:border-white/10 bg-surface-1/30 dark:bg-white/[0.02]"
             )}
           >
             <div className="flex items-center justify-between w-full px-4 py-3">
               <div className="flex items-center gap-2.5">
                 <Monitor
                   size={13}
-                  className={cn(systemAudioGranted ? "text-success/60" : "text-foreground/30")}
+                  className={cn(systemAudioGranted ? "text-success/60" : "text-foreground/45")}
                 />
                 <div>
                   <span className="text-xs font-medium text-foreground/70">
                     {t("notes.onboarding.systemAudio.title")}
                   </span>
-                  <p className="text-xs text-foreground/30 leading-relaxed mt-0.5">
+                  <p className="text-xs text-foreground/45 leading-relaxed mt-0.5">
                     {t("notes.onboarding.systemAudio.description")}
                   </p>
                 </div>
               </div>
               {systemAudioGranted ? (
-                <span className="text-xs text-success/60 font-medium shrink-0">
+                <span className="text-xs font-medium text-success/60 shrink-0">
                   {t("notes.onboarding.systemAudio.enabled")}
                 </span>
               ) : (
@@ -241,7 +241,7 @@ export default function NotesOnboarding({ onComplete }: NotesOnboardingProps) {
             </span>
           </div>
           {builtInAction && (
-            <div className="flex items-center gap-3 px-3 py-2.5 rounded-lg border border-foreground/6 dark:border-white/6 bg-surface-1/20 dark:bg-white/[0.02]">
+            <div className="flex items-center gap-3 px-3 py-2.5 rounded-lg border border-foreground/6 dark:border-white/10 bg-surface-1/20 dark:bg-white/[0.02]">
               <div className="w-7 h-7 rounded-md bg-accent/8 dark:bg-accent/12 border border-accent/10 dark:border-accent/15 flex items-center justify-center shrink-0">
                 <Sparkles size={12} className="text-accent/60" />
               </div>
@@ -249,11 +249,11 @@ export default function NotesOnboarding({ onComplete }: NotesOnboardingProps) {
                 <p className="text-xs font-medium text-foreground/70 truncate">
                   {getActionName(builtInAction, t)}
                 </p>
-                <p className="text-xs text-foreground/25 truncate">
+                <p className="text-xs text-foreground/45 truncate">
                   {getActionDescription(builtInAction, t)}
                 </p>
               </div>
-              <span className="text-xs text-foreground/15 font-medium shrink-0">
+              <span className="text-xs text-foreground/45 font-medium shrink-0">
                 {t("notes.actions.builtIn")}
               </span>
             </div>
@@ -273,7 +273,7 @@ export default function NotesOnboarding({ onComplete }: NotesOnboardingProps) {
                   <div className="flex-1 min-w-0">
                     <p className="text-xs font-medium text-foreground/70 truncate">{action.name}</p>
                     {action.description && (
-                      <p className="text-xs text-foreground/25 truncate">{action.description}</p>
+                      <p className="text-xs text-foreground/45 truncate">{action.description}</p>
                     )}
                   </div>
                 </div>
@@ -286,17 +286,17 @@ export default function NotesOnboarding({ onComplete }: NotesOnboardingProps) {
         <div
           className={cn(
             "rounded-lg border transition-colors duration-200",
-            "border-foreground/8 dark:border-white/6 bg-surface-1/30 dark:bg-white/[0.02]"
+            "border-foreground/8 dark:border-white/10 bg-surface-1/30 dark:bg-white/[0.02]"
           )}
         >
           <button
             type="button"
             onClick={() => setCreateExpanded(!createExpanded)}
             aria-expanded={createExpanded}
-            className="flex items-center justify-between w-full px-4 py-3 text-left"
+            className="flex items-center justify-between w-full px-4 py-3 text-start"
           >
             <div className="flex items-center gap-2.5">
-              <Plus size={13} className="text-foreground/30" />
+              <Plus size={13} className="text-foreground/45" />
               <span className="text-xs font-medium text-foreground/70">
                 {t("notes.onboarding.actions.createTitle")}
               </span>
@@ -309,18 +309,19 @@ export default function NotesOnboarding({ onComplete }: NotesOnboardingProps) {
             <ChevronRight
               size={12}
               className={cn(
-                "text-foreground/20 transition-transform duration-200",
-                createExpanded && "rotate-90"
+                "text-foreground/45 transition-transform duration-200",
+                createExpanded ? "rotate-90" : "rtl:rotate-180"
               )}
             />
           </button>
 
           {createExpanded && (
             <div className="px-4 pb-4 space-y-2" style={{ animation: "float-up 0.2s ease-out" }}>
-              <p className="text-xs text-foreground/30 leading-relaxed">
+              <p className="text-xs text-foreground/45 leading-relaxed">
                 {t("notes.onboarding.actions.createDescription")}
               </p>
               <input
+                dir="auto"
                 type="text"
                 value={actionName}
                 onChange={(e) => setActionName(e.target.value)}
@@ -330,6 +331,7 @@ export default function NotesOnboarding({ onComplete }: NotesOnboardingProps) {
                 className={cn(notesInputClass, "disabled:opacity-40")}
               />
               <input
+                dir="auto"
                 type="text"
                 value={actionDescription}
                 onChange={(e) => setActionDescription(e.target.value)}
@@ -339,6 +341,7 @@ export default function NotesOnboarding({ onComplete }: NotesOnboardingProps) {
                 className={cn(notesInputClass, "disabled:opacity-40")}
               />
               <textarea
+                dir="auto"
                 value={actionPrompt}
                 onChange={(e) => setActionPrompt(e.target.value)}
                 placeholder={t("notes.actions.promptPlaceholder")}

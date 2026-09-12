@@ -1,13 +1,37 @@
-import { useState, useRef, useEffect, useCallback } from "react";
+import { useState, useRef, useEffect } from "react";
 import { useTranslation } from "react-i18next";
 import { Button } from "./button";
 import { Tooltip } from "./tooltip";
-import { Copy, Trash2, FileText, FolderOpen, RotateCcw, Loader2, AlertCircle, Check } from "lucide-react";
-import type { TranscriptionItem as TranscriptionItemType } from "../../types/electron";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "./dropdown-menu";
+import {
+  Check,
+  Copy,
+  Trash2,
+  FileText,
+  FolderOpen,
+  RotateCcw,
+  Loader2,
+  AlertCircle,
+  ArchiveRestore,
+  MoreVertical,
+} from "../icons";
+import type {
+  TranscriptionItem as TranscriptionItemType,
+  TranscriptionErrorCode,
+} from "../../types/electron";
 import { cn } from "../lib/utils";
 import { getCachedPlatform } from "../../utils/platform";
+import { formatMmSs } from "../../utils/formatDuration";
 
 const platform = getCachedPlatform();
+
+const ACTION_BUTTON_CLASS =
+  "h-7 w-7 rounded-full text-muted-foreground/70 hover:text-foreground hover:bg-foreground/6 dark:hover:bg-white/6";
 
 function getShowInFolderKey(): string {
   if (platform === "win32") return "controlPanel.history.showInFolderWindows";
@@ -15,15 +39,23 @@ function getShowInFolderKey(): string {
   return "controlPanel.history.showInFolder";
 }
 
+interface MenuAction {
+  key: string;
+  icon: typeof Copy;
+  label: string;
+  onSelect: () => void;
+  destructive?: boolean;
+}
+
 interface TranscriptionItemProps {
   item: TranscriptionItemType;
   onCopy: (text: string) => void;
   onDelete: (id: number) => void;
   onShowAudioInFolder?: (id: number) => void;
-  onRetryTranscription?: (id: number) => Promise<void>;
+  onRetryTranscription?: (id: number, options?: { isRecover?: boolean }) => Promise<void>;
   onOpenSettings?: () => void;
   trainingDataEnabled?: boolean;
-  onUpdateCorrection?: (id: number, correctedText: string, originalText: string) => void;
+  onUpdateCorrection?: (id: number, correctedText: string, originalText: string) => Promise<void>;
 }
 
 export default function TranscriptionItem({
@@ -37,11 +69,8 @@ export default function TranscriptionItem({
   onUpdateCorrection,
 }: TranscriptionItemProps) {
   const { t, i18n } = useTranslation();
-  const [isHovered, setIsHovered] = useState(false);
   const [isExpanded, setIsExpanded] = useState(false);
   const [isRetrying, setIsRetrying] = useState(false);
-  const [showSaved, setShowSaved] = useState(false);
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   const timestampSource = item.timestamp.endsWith("Z") ? item.timestamp : `${item.timestamp}Z`;
   const timestampDate = new Date(timestampSource);
@@ -56,232 +85,310 @@ export default function TranscriptionItem({
     if (isRetrying || !onRetryTranscription) return;
     setIsRetrying(true);
     try {
-      await onRetryTranscription(item.id);
+      await onRetryTranscription(item.id, { isRecover: item.status === "discarded" });
     } finally {
       setIsRetrying(false);
     }
   };
 
   const isFailed = item.status === "failed";
-  const hasRawText = item.raw_text !== null;
+  const isDiscarded = item.status === "discarded";
+  const isTranscribed = !isFailed && !isDiscarded;
+  const discardedDuration =
+    item.audio_duration_ms && item.audio_duration_ms > 0
+      ? formatMmSs(Math.round(item.audio_duration_ms / 1000))
+      : null;
+  const rawText = item.raw_text;
   const hasAudio = item.has_audio === 1;
-  const showUtilityGroup = hasRawText || hasAudio;
+
   const isCorrected = item.corrected_transcription != null;
-  const displayText = isCorrected ? item.corrected_transcription! : item.text;
-  const isEditable = trainingDataEnabled && !isFailed;
-
+  const displayText = item.corrected_transcription ?? item.text;
+  const isEditable = trainingDataEnabled && isTranscribed;
   const [editText, setEditText] = useState(displayText);
+  const [showSaved, setShowSaved] = useState(false);
+  const [saveFailed, setSaveFailed] = useState(false);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
 
-  // Sync edit text when item changes externally (e.g., broadcast from another window)
   useEffect(() => {
-    setEditText(isCorrected ? item.corrected_transcription! : item.text);
-  }, [item.text, item.corrected_transcription, isCorrected]);
-
-  // Auto-resize textarea
+    setEditText(displayText);
+  }, [displayText]);
   useEffect(() => {
     if (textareaRef.current) {
       textareaRef.current.style.height = "auto";
       textareaRef.current.style.height = `${textareaRef.current.scrollHeight}px`;
     }
   }, [editText, isEditable]);
+  useEffect(() => {
+    if (!showSaved) return;
+    const timer = setTimeout(() => setShowSaved(false), 2000);
+    return () => clearTimeout(timer);
+  }, [showSaved]);
 
-  const handleBlur = useCallback(() => {
-    if (!onUpdateCorrection || !item.raw_text) return;
-    const trimmed = editText.trim();
-    if (trimmed === displayText) return;
-    onUpdateCorrection(item.id, trimmed, item.raw_text);
-    setShowSaved(true);
-    setTimeout(() => setShowSaved(false), 2000);
-  }, [editText, displayText, item.id, item.raw_text, onUpdateCorrection]);
+  const handleBlur = async () => {
+    if (!onUpdateCorrection || rawText == null || editText.trim() === displayText) return;
+    setShowSaved(false);
+    setSaveFailed(false);
+    try {
+      await onUpdateCorrection(item.id, editText.trim(), rawText);
+      setShowSaved(true);
+    } catch {
+      setSaveFailed(true);
+    }
+  };
+
+  const errorCode = item.error_code as TranscriptionErrorCode;
+  const isConfigError =
+    errorCode === "API_KEY_MISSING" ||
+    errorCode === "INVALID_KEY" ||
+    errorCode === "MODEL_NOT_AVAILABLE" ||
+    errorCode === "CUSTOM_ENDPOINT_INVALID";
+  const isLimitError = errorCode === "LIMIT_REACHED";
+  const isOfflineError = errorCode === "OFFLINE";
+
+  const retryLabel = t(
+    item.route_kind === "translation"
+      ? "controlPanel.history.retryTranslationMode"
+      : "controlPanel.history.retryTranscription"
+  );
+
+  // Copy stays visible as the one-tap action; everything else lives in the menu.
+  const candidateActions: (MenuAction | false)[] = [
+    isDiscarded &&
+      hasAudio && {
+        key: "recover",
+        icon: ArchiveRestore,
+        label: t("controlPanel.history.discarded.recover"),
+        onSelect: handleRetry,
+      },
+    !isDiscarded &&
+      hasAudio && { key: "retry", icon: RotateCcw, label: retryLabel, onSelect: handleRetry },
+    isTranscribed &&
+      rawText !== null && {
+        key: "raw",
+        icon: FileText,
+        label: t("controlPanel.history.viewRawTranscript"),
+        onSelect: () => setIsExpanded((expanded) => !expanded),
+      },
+    hasAudio && {
+      key: "folder",
+      icon: FolderOpen,
+      label: t(getShowInFolderKey()),
+      onSelect: () => onShowAudioInFolder?.(item.id),
+    },
+    {
+      key: "delete",
+      icon: Trash2,
+      label: t("controlPanel.history.deleteItem"),
+      onSelect: () => onDelete(item.id),
+      destructive: true,
+    },
+  ];
+  const menuActions = candidateActions.filter((action): action is MenuAction => action !== false);
 
   return (
     <div
       className={cn(
-        "group rounded-md border px-3 py-2.5 transition-colors duration-150",
+        "group/row px-4 py-3 transition-colors duration-150",
         isFailed
-          ? "border-destructive/30 bg-destructive/5 hover:bg-destructive/10"
-          : "border-border/40 dark:border-border-subtle/60 bg-card/50 dark:bg-surface-2/60 hover:bg-muted/30 dark:hover:bg-surface-2/80",
-        isCorrected && "border-l-2 border-l-primary"
+          ? "bg-destructive/5"
+          : isDiscarded
+            ? "bg-muted/20 opacity-80"
+            : "hover:bg-muted/20 dark:hover:bg-white/2",
+        // Translation rows get a 2px primary accent; ps-[14px] keeps text aligned with the other rows.
+        item.route_kind === "translation" && "border-s-2 border-s-primary/70 ps-[14px]",
+        isCorrected && "border-s-2 border-s-primary ps-[14px]"
       )}
-      onMouseEnter={() => setIsHovered(true)}
-      onMouseLeave={() => setIsHovered(false)}
     >
-      <div className="flex items-start gap-3">
-        {formattedTime && (
-          <span className="shrink-0 text-[11px] text-muted-foreground tabular-nums pt-0.5">
-            {formattedTime}
-          </span>
-        )}
-
-        {isFailed ? (
-          <div className="flex-1 min-w-0 flex items-start gap-2">
-            <AlertCircle size={14} className="shrink-0 text-destructive mt-0.5" />
-            <div className="min-w-0">
-              <p className="text-sm text-destructive font-medium">
-                {t("controlPanel.history.transcriptionFailed")}
-              </p>
-              {item.error_message && (
-                <p className="text-xs text-muted-foreground mt-0.5 truncate">
-                  {item.error_message}
-                </p>
-              )}
-              <p className="text-xs text-muted-foreground mt-1">
-                {hasAudio ? (
-                  <>
-                    <button
-                      onClick={() => onOpenSettings?.()}
-                      className="text-primary hover:underline cursor-pointer"
-                    >
-                      {t("controlPanel.history.failedCtaSettings")}
-                    </button>{" "}
-                    {t("controlPanel.history.failedCtaAndRetry")}
-                  </>
-                ) : (
-                  <button
-                    onClick={() => onOpenSettings?.()}
-                    className="text-primary hover:underline cursor-pointer"
-                  >
-                    {t("controlPanel.history.failedCtaSettingsOnly")}
-                  </button>
-                )}
-              </p>
-            </div>
-          </div>
-        ) : isEditable ? (
-          <div className="flex-1 min-w-0 relative">
-            <textarea
-              ref={textareaRef}
-              value={editText}
-              onChange={(e) => setEditText(e.target.value)}
-              onBlur={handleBlur}
-              rows={1}
-              className="w-full rounded-sm text-foreground text-sm leading-[1.5] break-words bg-transparent border-none outline-none resize-none px-2 py-1.5 focus:ring-1 focus:ring-primary/30"
-            />
-            {showSaved && (
-              <span className="absolute -bottom-4 right-0 text-[10px] text-primary flex items-center gap-0.5 animate-in fade-in duration-200">
-                <Check size={10} />
-                {t("controlPanel.history.correctionSaved")}
-              </span>
-            )}
-          </div>
-        ) : (
-          <p className="flex-1 min-w-0 text-foreground text-sm leading-[1.5] break-words">
-            {displayText}
-          </p>
-        )}
-
+      <div className="flex items-center justify-between gap-3">
+        <span className="text-xs tabular-nums text-muted-foreground">{formattedTime}</span>
         <div
           className={cn(
-            "flex items-center gap-0.5 shrink-0 transition-opacity duration-150",
-            isFailed ? "opacity-100" : isHovered ? "opacity-100" : "opacity-0"
+            "-me-1.5 flex items-center gap-1 transition-opacity duration-150",
+            // Actions surface on hover, keyboard focus, or while the menu is open; failed and
+            // discarded rows keep them visible because recovery is the point of the row.
+            isTranscribed &&
+              "opacity-0 group-hover/row:opacity-100 has-[:focus-visible]:opacity-100 has-[[data-state=open]]:opacity-100"
           )}
         >
-          {isFailed && hasAudio && (
-            <Tooltip content={t("controlPanel.history.retryTranscription")}>
-              <Button
-                size="icon"
-                variant="ghost"
-                onClick={handleRetry}
-                disabled={isRetrying}
-                className="h-6 w-6 rounded-sm text-destructive hover:text-destructive hover:bg-destructive/10"
-              >
-                {isRetrying ? (
-                  <Loader2 size={12} className="animate-spin" />
-                ) : (
-                  <RotateCcw size={12} />
-                )}
-              </Button>
-            </Tooltip>
-          )}
-          {!isFailed && hasRawText && (
-            <Tooltip content={t("controlPanel.history.viewRawTranscript")}>
-              <Button
-                size="icon"
-                variant="ghost"
-                onClick={() => setIsExpanded(!isExpanded)}
-                className={cn(
-                  "h-6 w-6 rounded-sm text-muted-foreground hover:text-primary hover:bg-primary/10",
-                  isExpanded && "text-primary"
-                )}
-              >
-                <FileText size={12} />
-              </Button>
-            </Tooltip>
-          )}
-          {hasAudio && (
-            <Tooltip content={t(getShowInFolderKey())}>
-              <Button
-                size="icon"
-                variant="ghost"
-                onClick={() => onShowAudioInFolder?.(item.id)}
-                className="h-6 w-6 rounded-sm text-muted-foreground hover:text-primary hover:bg-primary/10"
-              >
-                <FolderOpen size={12} />
-              </Button>
-            </Tooltip>
-          )}
-          {!isFailed && hasAudio && (
-            <Tooltip content={t("controlPanel.history.retryTranscription")}>
-              <Button
-                size="icon"
-                variant="ghost"
-                onClick={handleRetry}
-                disabled={isRetrying}
-                className="h-6 w-6 rounded-sm text-muted-foreground hover:text-primary hover:bg-primary/10"
-              >
-                {isRetrying ? (
-                  <Loader2 size={12} className="animate-spin" />
-                ) : (
-                  <RotateCcw size={12} />
-                )}
-              </Button>
-            </Tooltip>
-          )}
-          {showUtilityGroup && <div className="w-px h-3 bg-border/30" />}
-          {!isFailed && (
+          {isTranscribed && (
             <Tooltip content={t("controlPanel.history.copyText")}>
               <Button
                 size="icon"
                 variant="ghost"
-                onClick={() => onCopy(item.text)}
-                className="h-6 w-6 rounded-sm text-muted-foreground hover:text-foreground hover:bg-foreground/10"
+                onClick={() => onCopy(displayText)}
+                className={ACTION_BUTTON_CLASS}
               >
-                <Copy size={12} />
+                <Copy size={13} />
               </Button>
             </Tooltip>
           )}
-          <Tooltip content={t("controlPanel.history.deleteItem")}>
-            <Button
-              size="icon"
-              variant="ghost"
-              onClick={() => onDelete(item.id)}
-              className="h-6 w-6 rounded-sm text-muted-foreground hover:text-destructive hover:bg-destructive/10"
-            >
-              <Trash2 size={12} />
-            </Button>
-          </Tooltip>
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button
+                size="icon"
+                variant="ghost"
+                disabled={isRetrying}
+                aria-label={t("controlPanel.history.moreActions")}
+                className={ACTION_BUTTON_CLASS}
+              >
+                {isRetrying ? (
+                  <Loader2 size={13} className="animate-spin" />
+                ) : (
+                  <MoreVertical size={13} />
+                )}
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end">
+              {menuActions.map(({ key, icon: Icon, label, onSelect, destructive }) => (
+                <DropdownMenuItem
+                  key={key}
+                  onSelect={onSelect}
+                  className={cn(
+                    "gap-2.5",
+                    destructive && "text-destructive focus:bg-destructive/8 focus:text-destructive"
+                  )}
+                >
+                  <Icon size={14} className="shrink-0 opacity-70" />
+                  {label}
+                </DropdownMenuItem>
+              ))}
+            </DropdownMenuContent>
+          </DropdownMenu>
         </div>
       </div>
 
-      {!isFailed && (
+      <div className="mt-1.5">
+        {isFailed ? (
+          <div className="flex items-start gap-2">
+            <AlertCircle size={14} className="mt-0.5 shrink-0 text-destructive" />
+            <div className="min-w-0">
+              <p className="text-sm font-medium text-destructive">
+                {t("controlPanel.history.transcriptionFailed")}
+              </p>
+              {item.error_message && (
+                <p className="mt-0.5 text-xs leading-relaxed wrap-break-word text-muted-foreground">
+                  {item.error_message}
+                </p>
+              )}
+              {isConfigError && (
+                <p className="mt-1 text-xs text-muted-foreground">
+                  {hasAudio ? (
+                    <>
+                      <button
+                        onClick={() => onOpenSettings?.()}
+                        className="cursor-pointer text-primary hover:underline"
+                      >
+                        {t("controlPanel.history.failedCtaSettings")}
+                      </button>{" "}
+                      {t("controlPanel.history.failedCtaAndRetry")}
+                    </>
+                  ) : (
+                    <button
+                      onClick={() => onOpenSettings?.()}
+                      className="cursor-pointer text-primary hover:underline"
+                    >
+                      {t("controlPanel.history.failedCtaSettingsOnly")}
+                    </button>
+                  )}
+                </p>
+              )}
+              {isLimitError && (
+                <p className="mt-1 text-xs text-muted-foreground">
+                  {t("controlPanel.history.failedLimitReached")}
+                </p>
+              )}
+              {isOfflineError && (
+                <p className="mt-1 text-xs text-muted-foreground">
+                  {t("controlPanel.history.failedOffline")}
+                </p>
+              )}
+            </div>
+          </div>
+        ) : isDiscarded ? (
+          <div className="flex items-center gap-2">
+            <span className="shrink-0 rounded-sm bg-muted px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+              {t("controlPanel.history.discarded.badge")}
+            </span>
+            <span className="truncate text-sm text-muted-foreground">
+              {discardedDuration
+                ? t("controlPanel.history.discarded.recordingWithDuration", {
+                    duration: discardedDuration,
+                  })
+                : t("controlPanel.history.discarded.recording")}
+            </span>
+          </div>
+        ) : isEditable ? (
+          <div>
+            <textarea
+              ref={textareaRef}
+              dir="auto"
+              aria-label={t("controlPanel.history.correctedTranscription")}
+              value={editText}
+              onChange={(event) => setEditText(event.target.value)}
+              onBlur={handleBlur}
+              rows={1}
+              className="w-full rounded-sm text-base leading-normal text-foreground bg-transparent border-none outline-none resize-none px-2 py-1.5 focus:ring-1 focus:ring-primary/30"
+            />
+            {showSaved && (
+              <span role="status" className="text-xs text-primary flex items-center gap-1">
+                <Check size={10} />
+                {t("controlPanel.history.correctionSaved")}
+              </span>
+            )}
+            {saveFailed && (
+              <span role="alert" className="text-xs text-destructive">
+                {t("controlPanel.history.correctionSaveFailed")}
+              </span>
+            )}
+          </div>
+        ) : (
+          <p
+            dir="auto"
+            className="text-base leading-normal wrap-break-word whitespace-pre-wrap text-foreground"
+          >
+            {displayText}
+          </p>
+        )}
+      </div>
+
+      {isTranscribed && rawText !== null && (
         <div
+          inert={!isExpanded && !isCorrected}
           className={cn(
-            "overflow-hidden transition-all duration-200",
-            isExpanded || isCorrected ? "max-h-96" : "max-h-0"
+            "grid transition-[grid-template-rows] duration-200",
+            isExpanded || isCorrected ? "grid-rows-[1fr]" : "grid-rows-[0fr]"
           )}
         >
-          <div className="border-t border-border/20 mt-2 pt-2">
-            <span className="text-[10px] font-medium text-muted-foreground uppercase tracking-wider">
-              {isCorrected
-                ? t("controlPanel.history.originalModelOutput")
-                : t("controlPanel.history.rawTranscript")}
-            </span>
-            <p className="text-xs text-muted-foreground/80 leading-relaxed mt-1">{item.raw_text}</p>
-            {!isCorrected && item.raw_text === item.text && (
-              <p className="text-[10px] text-muted-foreground/50 italic mt-1">
-                {t("controlPanel.history.noAiProcessing")}
+          <div className="min-h-0 overflow-hidden">
+            <div className="mt-2 border-t border-border/70 pt-2">
+              <div className="flex items-center justify-between">
+                <span className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+                  {t(
+                    isCorrected
+                      ? "controlPanel.history.originalModelOutput"
+                      : "controlPanel.history.rawTranscript"
+                  )}
+                </span>
+                <Tooltip content={t("controlPanel.history.copyRawTranscript")}>
+                  <Button
+                    size="icon"
+                    variant="ghost"
+                    onClick={() => onCopy(rawText)}
+                    className="h-5 w-5 rounded-sm text-muted-foreground hover:bg-foreground/10 hover:text-foreground"
+                  >
+                    <Copy size={10} />
+                  </Button>
+                </Tooltip>
+              </div>
+              <p dir="auto" className="mt-1 text-xs leading-relaxed text-muted-foreground/80">
+                {rawText}
               </p>
-            )}
+              {!isCorrected && rawText === item.text && (
+                <p className="mt-1 text-[10px] italic text-muted-foreground/70">
+                  {t("controlPanel.history.noAiProcessing")}
+                </p>
+              )}
+            </div>
           </div>
         </div>
       )}

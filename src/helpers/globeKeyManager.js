@@ -16,9 +16,12 @@ const MAX_RESTART_ATTEMPTS = 3;
 const RESTART_DELAY_MS = 1000;
 // After this much sustained uptime, reset restart counter (allows future restarts after sleep/wake)
 const RESTART_RESET_MS = 10000;
+// Crash recovery is best-effort and must never hold the rest of app startup.
+const PREFERENCE_RECOVERY_TIMEOUT_MS = 2000;
+const PREFERENCE_RECOVERY_TERMINATION_TIMEOUT_MS = 1000;
 
 class GlobeKeyManager extends EventEmitter {
-  constructor() {
+  constructor({ preferenceStatePath = null } = {}) {
     super();
     this.process = null;
     this.isSupported = process.platform === "darwin";
@@ -26,11 +29,170 @@ class GlobeKeyManager extends EventEmitter {
     this._isStopping = false;
     this._restartCount = 0;
     this._restartResetTimer = null;
+    this._preferenceRecoveryBlocked = false;
+    this.preferenceStatePath = preferenceStatePath;
+    this.config = { mouseButtons: [], suppressGlobeAction: false };
+  }
+
+  // Replaces the listener's whole state, so every call has to pass all of it.
+  setConfiguration({ mouseButtons = [], suppressGlobeAction = false } = {}) {
+    const next = {
+      mouseButtons: [
+        ...new Set(mouseButtons.filter((button) => /^MouseButton[45]$/i.test(button))),
+      ].sort(),
+      suppressGlobeAction: Boolean(suppressGlobeAction),
+    };
+
+    if (JSON.stringify(next) === JSON.stringify(this.config)) {
+      return;
+    }
+
+    this.config = next;
+
+    if (!this.process) {
+      return;
+    }
+
+    // Reconfigure the running listener rather than restarting it: a restart
+    // drops events and briefly hands the Globe key back to macOS.
+    if (!this._sendConfiguration()) {
+      this.stop();
+      this.start();
+    }
+  }
+
+  _sendConfiguration() {
+    const child = this.process;
+    if (!child?.stdin?.writable) {
+      return false;
+    }
+    try {
+      // write() returning false is backpressure, not failure.
+      child.stdin.write(`${JSON.stringify(this.config)}\n`);
+      return true;
+    } catch (error) {
+      debugLogger.warn("[GlobeKeyManager] Failed to send configuration", { error: error.message });
+      return false;
+    }
+  }
+
+  _listenerArgs() {
+    const args = [];
+    if (this.config.mouseButtons.length > 0) {
+      args.push(this.config.mouseButtons.join(","));
+    }
+    if (this.preferenceStatePath) {
+      args.push("--globe-preference-state", this.preferenceStatePath);
+    }
+    if (this.config.suppressGlobeAction) {
+      args.push("--suppress-system-globe-action");
+    }
+    return args;
+  }
+
+  restoreLeftoverSystemPreference() {
+    if (!this.isSupported || !this.preferenceStatePath) {
+      return Promise.resolve();
+    }
+    if (!fs.existsSync(this.preferenceStatePath)) {
+      return Promise.resolve();
+    }
+
+    const listenerPath = this.resolveListenerBinary();
+    if (!listenerPath) {
+      debugLogger.warn("[GlobeKeyManager] Preference recovery skipped — binary not found");
+      return Promise.resolve();
+    }
+
+    const archMismatch = this._checkArchMismatch(listenerPath);
+    if (archMismatch) {
+      debugLogger.warn("[GlobeKeyManager] Preference recovery skipped", { error: archMismatch });
+      return Promise.resolve();
+    }
+
+    return new Promise((resolve) => {
+      let settled = false;
+      let recoveryTimeout = null;
+      let terminationTimeout = null;
+      let terminationRequested = false;
+      const finish = (error, code) => {
+        if (settled) return;
+        settled = true;
+        if (recoveryTimeout) clearTimeout(recoveryTimeout);
+        if (terminationTimeout) clearTimeout(terminationTimeout);
+        if (error || code !== 0) {
+          debugLogger.warn("[GlobeKeyManager] Preference recovery failed", {
+            error: error?.message,
+            code,
+          });
+        }
+        resolve();
+      };
+      const blockListenerStart = (error) => {
+        this._preferenceRecoveryBlocked = true;
+        finish(error);
+      };
+
+      try {
+        const child = spawn(
+          listenerPath,
+          [
+            "--globe-preference-state",
+            this.preferenceStatePath,
+            "--restore-leftover-globe-preference",
+          ],
+          { stdio: "ignore" }
+        );
+        child.once("error", (error) => {
+          if (terminationRequested) {
+            blockListenerStart(error);
+          } else {
+            finish(error);
+          }
+        });
+        child.once("exit", (code) =>
+          finish(
+            terminationRequested
+              ? new Error("Preference recovery helper was terminated after timing out")
+              : null,
+            code
+          )
+        );
+        recoveryTimeout = setTimeout(() => {
+          terminationRequested = true;
+          try {
+            child.kill("SIGKILL");
+          } catch (error) {
+            blockListenerStart(error);
+            return;
+          }
+          if (!settled) {
+            terminationTimeout = setTimeout(
+              () =>
+                blockListenerStart(
+                  new Error(
+                    `Preference recovery helper did not exit within ${PREFERENCE_RECOVERY_TERMINATION_TIMEOUT_MS}ms after SIGKILL`
+                  )
+                ),
+              PREFERENCE_RECOVERY_TERMINATION_TIMEOUT_MS
+            );
+          }
+        }, PREFERENCE_RECOVERY_TIMEOUT_MS);
+      } catch (error) {
+        finish(error);
+      }
+    });
   }
 
   start() {
     if (!this.isSupported) {
       debugLogger.info("[GlobeKeyManager] Skipped — not macOS");
+      return;
+    }
+    if (this._preferenceRecoveryBlocked) {
+      this.reportError(
+        new Error("Globe listener blocked because preference recovery could not be terminated")
+      );
       return;
     }
     if (this.process) {
@@ -75,8 +237,18 @@ class GlobeKeyManager extends EventEmitter {
     }
 
     this.hasReportedError = false;
-    this.process = spawn(listenerPath);
-    debugLogger.info("[GlobeKeyManager] Process spawned", { pid: this.process.pid });
+    const child = spawn(listenerPath, this._listenerArgs());
+    this.process = child;
+    debugLogger.info("[GlobeKeyManager] Process spawned", {
+      pid: child.pid,
+      config: this.config,
+    });
+
+    // A write racing the listener's shutdown can raise EPIPE, and an unhandled
+    // stream "error" event throws.
+    child.stdin.on("error", (error) => {
+      debugLogger.warn("[GlobeKeyManager] Listener stdin error", { error: error.message });
+    });
 
     // After sustained uptime, reset the restart counter so future sleep/wake
     // cycles get a fresh set of restart attempts
@@ -89,8 +261,8 @@ class GlobeKeyManager extends EventEmitter {
       }
     }, RESTART_RESET_MS);
 
-    this.process.stdout.setEncoding("utf8");
-    this.process.stdout.on("data", (chunk) => {
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
       chunk
         .split(/\r?\n/)
         .map((line) => line.trim())
@@ -100,6 +272,8 @@ class GlobeKeyManager extends EventEmitter {
             this.emit("globe-down");
           } else if (line === "FN_UP") {
             this.emit("globe-up");
+          } else if (line === "FN_INTERRUPTED") {
+            this.emit("globe-interrupted");
           } else if (line.startsWith("RIGHT_MOD_DOWN:")) {
             const modifier = line.replace("RIGHT_MOD_DOWN:", "").trim();
             if (modifier) {
@@ -115,12 +289,22 @@ class GlobeKeyManager extends EventEmitter {
             if (modifier) {
               this.emit("modifier-up", modifier);
             }
+          } else if (line.startsWith("MOUSE_BUTTON_DOWN:")) {
+            const button = line.replace("MOUSE_BUTTON_DOWN:", "").trim();
+            if (button) {
+              this.emit("mouse-button-down", button);
+            }
+          } else if (line.startsWith("MOUSE_BUTTON_UP:")) {
+            const button = line.replace("MOUSE_BUTTON_UP:", "").trim();
+            if (button) {
+              this.emit("mouse-button-up", button);
+            }
           }
         });
     });
 
-    this.process.stderr.setEncoding("utf8");
-    this.process.stderr.on("data", (data) => {
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (data) => {
       const message = data.toString().trim();
       if (message.length > 0) {
         if (message.includes("Failed to create event monitor")) {
@@ -131,14 +315,19 @@ class GlobeKeyManager extends EventEmitter {
       }
     });
 
-    this.process.on("error", (error) => {
+    child.on("error", (error) => {
       debugLogger.info("[GlobeKeyManager] Process error", { error: error.message });
       this.reportError(error);
-      this.process = null;
+      if (this.process === child) this.process = null;
     });
 
-    this.process.on("exit", (code, signal) => {
+    child.on("exit", (code, signal) => {
       debugLogger.info("[GlobeKeyManager] Process exited", { code, signal });
+      // Only clear instance state if this is still the current process — a prior
+      // stop()+start() (e.g. a setConfiguration fallback) may have already replaced it.
+      if (this.process !== child) {
+        return;
+      }
       this.process = null;
       if (this._restartResetTimer) {
         clearTimeout(this._restartResetTimer);

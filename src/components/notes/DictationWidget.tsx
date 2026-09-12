@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { Mic, Square, Loader2 } from "lucide-react";
+import { Mic, Square, Loader2 } from "../icons";
 import { cn } from "../lib/utils";
+import { formatMmSs } from "../../utils/formatDuration";
 
 interface DictationWidgetProps {
   isRecording: boolean;
@@ -22,18 +23,20 @@ export default function DictationWidget({
 }: DictationWidgetProps) {
   const { t } = useTranslation();
   const [elapsed, setElapsed] = useState(0);
+  const [wasRecording, setWasRecording] = useState(isRecording);
+
+  if (isRecording !== wasRecording) {
+    setWasRecording(isRecording);
+    if (!isRecording) setElapsed(0);
+  }
 
   useEffect(() => {
-    if (!isRecording) {
-      setElapsed(0);
-      return;
-    }
+    if (!isRecording) return;
     const id = setInterval(() => setElapsed((s) => s + 1), 1000);
     return () => clearInterval(id);
   }, [isRecording]);
 
-  const minutes = String(Math.floor(elapsed / 60)).padStart(2, "0");
-  const seconds = String(elapsed % 60).padStart(2, "0");
+  const elapsedLabel = formatMmSs(elapsed);
 
   return (
     <div className="absolute bottom-5 left-0 right-0 z-10 flex justify-center pointer-events-none">
@@ -75,7 +78,7 @@ export default function DictationWidget({
               animation: "fade-in-content 0.3s ease-out 0.25s both",
             }}
           >
-            {minutes}:{seconds}
+            {elapsedLabel}
           </span>
 
           <button

@@ -1,9 +1,9 @@
 import React from "react";
-import { Check, LucideIcon } from "lucide-react";
+import { Check, IconComponent } from "../icons";
 
 interface Step {
   title: string;
-  icon: LucideIcon;
+  icon: IconComponent;
 }
 
 interface StepProgressProps {
@@ -14,7 +14,7 @@ interface StepProgressProps {
 
 export default function StepProgress({ steps, currentStep, className = "" }: StepProgressProps) {
   return (
-    <div className={`flex items-center justify-center gap-0.5 ${className}`}>
+    <div className={`flex items-center justify-center gap-0.5 whitespace-nowrap ${className}`}>
       {steps.map((step, index) => {
         const Icon = step.icon;
         const isActive = index === currentStep;
@@ -28,7 +28,7 @@ export default function StepProgress({ steps, currentStep, className = "" }: Ste
                   ? "bg-primary/10 text-primary"
                   : isCompleted
                     ? "text-success"
-                    : "text-muted-foreground/40"
+                    : "text-muted-foreground/70"
               }`}
             >
               <div
@@ -37,7 +37,7 @@ export default function StepProgress({ steps, currentStep, className = "" }: Ste
                     ? "bg-primary text-primary-foreground"
                     : isCompleted
                       ? "bg-success/15 text-success"
-                      : "bg-muted text-muted-foreground/40"
+                      : "bg-muted text-muted-foreground/70"
                 }`}
               >
                 {isCompleted ? (
@@ -52,7 +52,7 @@ export default function StepProgress({ steps, currentStep, className = "" }: Ste
                     ? "text-primary"
                     : isCompleted
                       ? "text-success"
-                      : "text-muted-foreground/40"
+                      : "text-muted-foreground/70"
                 }`}
               >
                 {step.title}
