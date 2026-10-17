@@ -2,7 +2,7 @@ import type { ReasoningConfig } from "../BaseReasoningService";
 import { getOpenAiApiConfig } from "../../models/ModelRegistry";
 import { detectEndpointDialect } from "./thinkingSuppressionDialects";
 import { getModelFamilyConstraints } from "./modelFamilyConstraints";
-import { applyThinkingSuppression } from "./thinkingSuppression";
+import { applyThinkingSuppression, isThinkingSuppressed } from "./thinkingSuppression";
 
 /**
  * Providers whose OpenAI-compat chat endpoints speak the legacy shape: always
@@ -19,7 +19,8 @@ const LEGACY_CHAT_COMPLETIONS_PROVIDERS = new Set(["local", "lan", "groq", "tinf
  * param, temperature, family reasoning effort, and thinking suppression.
  * Callers own `model`/`messages`/`stream`; this owns every tunable param, so
  * a family or provider fact changed in the data tables reaches all transports
- * at once instead of one call site at a time (#1611).
+ * at once instead of one call site at a time (#1611). Responses bodies get the
+ * same family effort from familyResponsesEffort; keep the two in step.
  */
 export function applyChatCompletionsParams(
   requestBody: Record<string, unknown>,
@@ -58,16 +59,87 @@ export function applyChatCompletionsParams(
   // preferred effort — see modelFamilyConstraints for the gpt-oss rationale.
   // applyThinkingSuppression still wins when thinking is disabled by the user.
   const familyEffort = getModelFamilyConstraints(model)?.reasoningEffort;
-  if (familyEffort?.cleanupValue && (!config.systemPrompt || config.requireCompleteOutput)) {
+  if (familyEffort?.cleanupValue && isDeterministicTransform(config)) {
     requestBody.reasoning_effort = familyEffort.cleanupValue;
   }
 
-  applyThinkingSuppression(requestBody, model, provider, config, endpoint ?? undefined);
+  const suppressed = applyThinkingSuppression(
+    requestBody,
+    model,
+    provider,
+    config,
+    endpoint ?? undefined
+  );
+  // Some dialects suppress through other fields, so a default effort beside
+  // them would contradict the suppression.
+  if (!suppressed && familyEffort?.defaultValue) {
+    requestBody.reasoning_effort ??= familyEffort.defaultValue;
+  }
+}
+
+/**
+ * The family's effort for a Responses API body (`reasoning: { effort }`), by
+ * the same rules as the chat body above. A model outside the family table
+ * sends no effort, leaving the server's default.
+ */
+export function familyResponsesEffort(model: string, config: ReasoningConfig): string | undefined {
+  const familyEffort = getModelFamilyConstraints(model)?.reasoningEffort;
+  if (!familyEffort) return undefined;
+  if (isThinkingSuppressed(model, config)) return familyEffort.suppressValue;
+  if (familyEffort.cleanupValue && isDeterministicTransform(config)) {
+    return familyEffort.cleanupValue;
+  }
+  return familyEffort.defaultValue;
+}
+
+function isDeterministicTransform(config: ReasoningConfig): boolean {
+  return !config.systemPrompt || !!config.requireCompleteOutput;
 }
 
 /** Finish reasons that mean the output hit the token cap, across providers. */
 export function isTruncatedFinishReason(reason: unknown): boolean {
   return reason === "length" || reason === "max_tokens";
+}
+
+/**
+ * Dictation cleanup renders these errors as the toast title, so they carry the key
+ * the renderer translates. Anthropic and enterprise attach the same key on the
+ * main-process side; local llama reports a code that localInferenceError.ts maps.
+ */
+export const TRUNCATED_OUTPUT_MESSAGE_KEY =
+  "hooks.audioRecording.errorDescriptions.cleanupTruncated";
+export const EMPTY_OUTPUT_MESSAGE_KEY = "hooks.audioRecording.errorDescriptions.cleanupEmptyReply";
+
+/** Output cut off at the token cap; providers may pass their own wording for the logs. */
+export function truncatedOutputError(
+  message = "Model output was truncated"
+): Error & { messageKey: string } {
+  return Object.assign(new Error(message), { messageKey: TRUNCATED_OUTPUT_MESSAGE_KEY });
+}
+
+/** A reply with no text at all; providers pass their own wording for the logs. */
+export function emptyOutputError(
+  message = "Model returned an empty response"
+): Error & { messageKey: string } {
+  return Object.assign(new Error(message), { messageKey: EMPTY_OUTPUT_MESSAGE_KEY });
+}
+
+/**
+ * Error for a completion that produced no text, or null when the caller may
+ * echo its input instead. Only the default cleanup transform (no systemPrompt)
+ * may echo: a prompted task would take its raw material as the finished result.
+ */
+export function emptyResponseError(
+  providerName: string,
+  config: ReasoningConfig,
+  responseIncomplete: boolean
+): Error | null {
+  if (responseIncomplete) {
+    return truncatedOutputError("Model ran out of output tokens before producing a response");
+  }
+  if (config.requireCompleteOutput) return emptyOutputError();
+  if (config.systemPrompt) return new Error(`${providerName} returned empty response`);
+  return null;
 }
 
 /**

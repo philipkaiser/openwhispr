@@ -10,6 +10,7 @@ import {
   Keyboard,
   CreditCard,
   Shield,
+  ShieldCheck,
   Users,
 } from "./icons";
 import SidebarModal, { type SidebarItem } from "./ui/SidebarModal";
@@ -179,12 +180,16 @@ export default function SettingsModal({ open, onOpenChange, initialSection }: Se
           </div>
         ) : undefined
       }
+      notice={
+        policyManaged
+          ? {
+              icon: <ShieldCheck className="h-3.5 w-3.5 shrink-0" />,
+              label: t("settingsModal.managedAccount"),
+              description: t("settingsModal.managedByOrg"),
+            }
+          : undefined
+      }
     >
-      {policyManaged && (
-        <div className="mx-4 mt-4 rounded-lg border border-primary/20 bg-primary/8 px-3 py-2 text-sm text-primary dark:border-primary/30 dark:bg-primary/15">
-          {t("settingsModal.managedByOrg")}
-        </div>
-      )}
       <SettingsPage
         activeSection={activeSection}
         onNavigateToSection={handleSectionChange}

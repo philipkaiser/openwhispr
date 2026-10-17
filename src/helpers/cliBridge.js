@@ -6,6 +6,7 @@ const crypto = require("crypto");
 const debugLogger = require("./debugLogger");
 const { isPortAvailable } = require("../utils/serverUtils");
 const { broadcastToWindows } = require("./windowBroadcast");
+const { NOTE_TEXT_FIELDS } = require("./noteFieldSync");
 
 const PORT_RANGE_START = 8200;
 const PORT_RANGE_END = 8219;
@@ -84,11 +85,37 @@ function parseIdParam(value) {
   return id;
 }
 
+function parsePositiveIntQuery(query, key, fallback) {
+  const raw = query.get(key);
+  if (raw === null || raw === "") return fallback;
+  const num = parseIdParam(raw);
+  if (num === null) {
+    const err = new Error(`Query parameter '${key}' must be a positive integer`);
+    err.code = "VALIDATION";
+    throw err;
+  }
+  return num;
+}
+
 function unwrapMutationResult(result, label) {
   if (!result?.success || !result[label]) {
     throw new Error(result?.error || `Failed to write ${label}`);
   }
   return result[label];
+}
+
+// The public v1 contract: a provided blank content or enhanced_content clears
+// that field. updateNote treats a bare blank as unconfirmed (never synced as a
+// clear), so the bridge states the intent; updateNote still validates it.
+function withProvidedBlanksCleared(body) {
+  const blanks = NOTE_TEXT_FIELDS.filter(
+    (field) =>
+      field in body &&
+      (body[field] == null || (typeof body[field] === "string" && !body[field].trim()))
+  );
+  if (blanks.length === 0 || (body.clear_fields !== undefined && !Array.isArray(body.clear_fields)))
+    return body;
+  return { ...body, clear_fields: [...new Set([...(body.clear_fields ?? []), ...blanks])] };
 }
 
 class CliBridge {
@@ -372,8 +399,8 @@ class CliBridge {
       exact("GET", "/v1/health", () => ({ data: { ok: true, version: 1 } })),
       exact("GET", "/v1/notes/list", ({ query }) => {
         const noteType = query.get("note_type") || null;
-        const limit = query.get("limit") ? Number(query.get("limit")) : 100;
-        const folderId = query.get("folder_id") ? Number(query.get("folder_id")) : null;
+        const limit = parsePositiveIntQuery(query, "limit", 100);
+        const folderId = parsePositiveIntQuery(query, "folder_id", null);
         const notes = db.getNotes(noteType, limit, folderId);
         return { data: notes, has_more: false, next_cursor: null };
       }),
@@ -384,7 +411,7 @@ class CliBridge {
           err.code = "VALIDATION";
           throw err;
         }
-        const limit = query.get("limit") ? Number(query.get("limit")) : 20;
+        const limit = parsePositiveIntQuery(query, "limit", 20);
         const notes = db.searchNotes(q, limit);
         return { data: notes, has_more: false, next_cursor: null };
       }),
@@ -412,7 +439,7 @@ class CliBridge {
           );
           const note = unwrapMutationResult(result, "note");
           setImmediate(() => broadcastToWindows("note-added", note));
-          ipc._asyncVectorUpsert(note);
+          ipc.notifyVectorChanges();
           ipc._asyncMirrorWrite(note);
           return { data: note };
         },
@@ -420,10 +447,22 @@ class CliBridge {
       ),
       param("PATCH", "/v1/notes/", "", "id", ({ params, body }) => {
         const id = requireId(params, "note");
-        const result = db.updateNote(id, body || {});
+        const existing = db.getNote(id);
+        if (!existing || existing.deleted_at) {
+          const err = new Error(`Note ${id} not found`);
+          err.code = "NOT_FOUND";
+          throw err;
+        }
+        const result = db.updateNote(id, withProvidedBlanksCleared(body || {}));
+        // The note exists, so a remaining error names a folder or space that doesn't.
+        if (result.error) {
+          const err = new Error(result.error);
+          err.code = "VALIDATION";
+          throw err;
+        }
         const note = unwrapMutationResult(result, "note");
         setImmediate(() => broadcastToWindows("note-updated", note));
-        ipc._asyncVectorUpsert(note);
+        ipc.notifyVectorChanges();
         ipc._asyncMirrorWrite(note);
         return { data: note };
       }),
@@ -523,7 +562,7 @@ class CliBridge {
         return { data: { text: result.text, provider, model } };
       }),
       exact("GET", "/v1/transcriptions/list", ({ query }) => {
-        const limit = query.get("limit") ? Number(query.get("limit")) : 50;
+        const limit = parsePositiveIntQuery(query, "limit", 50);
         return {
           data: db.getTranscriptions(limit),
           has_more: false,

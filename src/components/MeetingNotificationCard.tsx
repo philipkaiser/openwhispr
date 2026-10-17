@@ -1,3 +1,4 @@
+import type { ReactNode } from "react";
 import { X } from "./icons";
 import { cn } from "./lib/utils";
 import { BRAND_GLASS_SURFACE } from "./ui/gradientCircle";
@@ -7,10 +8,12 @@ interface MeetingNotificationCardProps {
   body: string;
   startLabel: string;
   onStart?: () => void;
+  picker?: ReactNode;
+  busy?: boolean;
+  dismissLabel?: string;
   onDismiss?: () => void;
   /** Controls the close button's hover fade. Ignored when `onDismiss` is absent. */
   closeVisible?: boolean;
-  allowTitleWrap?: boolean;
   className?: string;
   onMouseEnter?: () => void;
   onMouseLeave?: () => void;
@@ -27,9 +30,11 @@ export function MeetingNotificationCard({
   body,
   startLabel,
   onStart,
+  picker,
+  busy = false,
+  dismissLabel,
   onDismiss,
   closeVisible = true,
-  allowTitleWrap = false,
   className = "",
   onMouseEnter,
   onMouseLeave,
@@ -41,6 +46,7 @@ export function MeetingNotificationCard({
         "bg-card/95 dark:bg-surface-2/95 backdrop-blur-xl",
         "border border-border/70 dark:border-border-subtle/60",
         "rounded-xl shadow-lg p-2.5",
+        picker ? "min-h-[60px] flex flex-col justify-center" : "",
         className,
       ].join(" ")}
       onMouseEnter={onMouseEnter}
@@ -48,7 +54,10 @@ export function MeetingNotificationCard({
     >
       {onDismiss && (
         <button
+          data-meeting-region="dismiss"
           onClick={onDismiss}
+          disabled={busy}
+          aria-label={dismissLabel}
           className={[
             "absolute -left-2.5 -top-2.5 z-10 size-6 rounded-full",
             "flex items-center justify-center",
@@ -74,12 +83,7 @@ export function MeetingNotificationCard({
         </div>
 
         <div className="flex-1 min-w-0">
-          <p
-            className={[
-              "text-[12px] font-semibold text-foreground leading-tight",
-              allowTitleWrap ? "whitespace-normal break-words" : "truncate",
-            ].join(" ")}
-          >
+          <p className="truncate text-[12px] font-semibold text-foreground leading-tight">
             {title}
           </p>
           <p className="text-[11px] text-muted-foreground leading-tight mt-0.5 break-words">
@@ -87,15 +91,21 @@ export function MeetingNotificationCard({
           </p>
         </div>
 
-        <button
-          onClick={onStart}
+        <div
           className={cn(
             BRAND_GLASS_SURFACE,
-            "shrink-0 whitespace-nowrap rounded-full px-2.5 py-1 text-[11px] font-medium transition-[filter] hover:brightness-110 active:brightness-95"
+            "meeting-folder-compound shrink-0 inline-flex items-stretch rounded-full"
           )}
         >
-          {startLabel}
-        </button>
+          <button
+            onClick={onStart}
+            disabled={busy}
+            className="whitespace-nowrap rounded-full px-2.5 py-1 text-[11px] font-medium hover:brightness-110 active:brightness-95 disabled:opacity-60"
+          >
+            {startLabel}
+          </button>
+          {picker}
+        </div>
       </div>
     </div>
   );
